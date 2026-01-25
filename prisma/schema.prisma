@@ -1,0 +1,84 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String?
+  image         String?
+  events        Event[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Event {
+  id              String           @id @default(uuid())
+  userId          String
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title           String
+  description     String?
+  color           String?          @default("#3b82f6")
+
+  // 時間設定
+  startAt         DateTime
+  endAt           DateTime
+
+  // ポモドーロ設定
+  isPomodoro      Boolean          @default(false)
+  inputDuration   Int              @default(20)
+  outputDuration  Int              @default(5)
+
+  // 繰り返し設定 (RFC 5545)
+  isRecurring     Boolean          @default(false)
+  rrule           String?
+  
+  exceptions      EventException[]
+  pomodoroLogs    PomodoroLog[]
+
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([userId])
+}
+
+model EventException {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  
+  originalDate  DateTime
+  isDeleted     Boolean  @default(false)
+  
+  title         String?
+  startAt       DateTime?
+  endAt         DateTime?
+
+  @@index([eventId])
+}
+
+model PomodoroLog {
+  id              String   @id @default(uuid())
+  eventId         String
+  event           Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  
+  actualDate      DateTime
+  blurtingText    String   @db.Text
+  
+  inputMinutes    Int
+  outputMinutes   Int
+
+  createdAt       DateTime @default(now())
+
+  @@index([eventId])
+  @@index([actualDate])
+}
