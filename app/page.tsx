@@ -1,33 +1,32 @@
+import { createClient } from '@/utils/supabase/server';
+import { redirect } from 'next/navigation';
 import { AuthButton } from '@/components/auth-button';
-import Link from 'next/link';
 
-export default function Home() {
+export default async function Home() {
+  const supabase = await createClient();
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  // 認証済みユーザーは自動的にダッシュボードへ
+  if (user) {
+    redirect('/dashboard');
+  }
+
   return (
-    <div className="min-h-screen bg-background">
-      <header className="border-b">
-        <div className="container mx-auto px-4 py-4 flex justify-between items-center">
-          <h1 className="text-xl font-bold">Pomodoro Calendar</h1>
+    <div className="min-h-screen bg-background flex items-center justify-center">
+      <div className="max-w-md w-full px-4">
+        <div className="text-center mb-8">
+          <h1 className="text-3xl font-bold mb-2">Pomodoro Calendar</h1>
+          <p className="text-muted-foreground">
+            Sign in to get started
+          </p>
+        </div>
+        <div className="flex justify-center">
           <AuthButton />
         </div>
-      </header>
-      <main className="container mx-auto px-4 py-16">
-        <div className="max-w-2xl mx-auto text-center">
-          <h2 className="text-4xl font-bold tracking-tight mb-6">
-            Welcome to Pomodoro Calendar
-          </h2>
-          <p className="text-lg text-muted-foreground mb-8">
-            Sign in with Google to get started with your productivity journey.
-          </p>
-          <div className="flex justify-center gap-4">
-            <Link
-              href="/dashboard"
-              className="inline-flex items-center justify-center rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-primary text-primary-foreground hover:bg-primary/90 h-10 px-4 py-2"
-            >
-              Go to Dashboard
-            </Link>
-          </div>
-        </div>
-      </main>
+      </div>
     </div>
   );
 }
