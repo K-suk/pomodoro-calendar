@@ -26,14 +26,29 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { AuthButton } from "@/components/auth-button";
-import { PomodoroTimerModal } from "@/components/pomodoro/pomodoro-timer-modal";
+import { PomodoroTimerModal, MiniTimer } from "@/components/pomodoro/pomodoro-timer-modal";
 import { EventCreateModal, type EventFormData } from "@/components/calendar/event-create-modal";
+import { usePomodoroTimer, type PomodoroPhase } from "@/hooks/use-pomodoro-timer";
+import { useBlurtingSession } from "@/hooks/use-blurting-session";
+import { BlurtingModal } from "@/components/pomodoro/blurting-modal";
+
+// Find the current active pomodoro event
+function findActivePomodoro(events: EventRecord[]): EventRecord | null {
+  const now = new Date().getTime();
+  return events.find((event) => {
+    if (!event.isPomodoro) return false;
+    const start = new Date(event.startAt).getTime();
+    const end = new Date(event.endAt).getTime();
+    return now >= start && now <= end;
+  }) || null;
+}
 
 type EventRecord = {
   id: string;
   title: string;
   description: string | null;
   color: string | null;
+  categoryId: string | null;
   startAt: string;
   endAt: string;
   isPomodoro: boolean;
@@ -73,9 +88,63 @@ export function PomodoroCalendar() {
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const gridRef = React.useRef<HTMLDivElement>(null);
   const [timerModalOpen, setTimerModalOpen] = React.useState(false);
-  const [selectedEvent, setSelectedEvent] = React.useState<EventRecord | null>(null);
+  const [editingEvent, setEditingEvent] = React.useState<EventRecord | null>(null);
   const [createModalInitialDate, setCreateModalInitialDate] = React.useState<Date | undefined>();
   const [createModalInitialEndDate, setCreateModalInitialEndDate] = React.useState<Date | undefined>();
+
+  // Active pomodoro session state (persists even when modal is closed)
+  const [activePomodoro, setActivePomodoro] = React.useState<EventRecord | null>(null);
+  const [showBlurtingModal, setShowBlurtingModal] = React.useState(false);
+
+  // Blurting session hook (must be declared before handlePhaseChange)
+  const blurtingSession = useBlurtingSession();
+
+  // Timer hook for persistent timer
+  const handlePhaseChange = React.useCallback((phase: PomodoroPhase) => {
+    if (phase === "output") {
+      blurtingSession.startSession();
+      setShowBlurtingModal(true);
+    }
+  }, [blurtingSession]);
+
+  const persistentTimer = usePomodoroTimer(
+    activePomodoro?.inputDuration ?? 25,
+    activePomodoro?.outputDuration ?? 5,
+    handlePhaseChange
+  );
+
+  // Check for active pomodoro every second
+  React.useEffect(() => {
+    const checkActivePomodoro = () => {
+      const active = findActivePomodoro(events);
+
+      if (active && !activePomodoro) {
+        // New active pomodoro found - auto start!
+        setActivePomodoro(active);
+        setTimerModalOpen(true);
+      } else if (!active && activePomodoro) {
+        // Active pomodoro ended
+        if (persistentTimer.state.phase === "completed" || persistentTimer.state.phase === "idle") {
+          setActivePomodoro(null);
+          persistentTimer.reset();
+          blurtingSession.resetSession();
+        }
+      }
+    };
+
+    checkActivePomodoro();
+    const interval = setInterval(checkActivePomodoro, 1000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [events, activePomodoro, persistentTimer.state.phase]);
+
+  // Start timer when activePomodoro is set
+  React.useEffect(() => {
+    if (activePomodoro && persistentTimer.state.phase === "idle") {
+      persistentTimer.start();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePomodoro, persistentTimer.state.phase]);
 
   // Drag state
   const [dragState, setDragState] = React.useState<DragState>({
@@ -245,11 +314,12 @@ export function PomodoroCalendar() {
       startAt: new Date(formData.startAt).toISOString(),
       endAt: new Date(formData.endAt).toISOString(),
       color: formData.color || "#EA2831",
+      categoryId: formData.categoryId,
       isPomodoro: formData.isPomodoro,
       inputDuration: formData.inputDuration,
       outputDuration: formData.outputDuration,
       isRecurring: formData.isRecurring,
-      rrule: null,
+      rrule: formData.rrule,
     };
 
     const response = await fetch("/api/events", {
@@ -274,18 +344,107 @@ export function PomodoroCalendar() {
     });
   };
 
-  // Calculate event position and height
-  const getEventStyle = (event: EventRecord) => {
+  // Check if two events overlap
+  const eventsOverlap = (event1: EventRecord, event2: EventRecord) => {
+    const start1 = new Date(event1.startAt).getTime();
+    const end1 = new Date(event1.endAt).getTime();
+    const start2 = new Date(event2.startAt).getTime();
+    const end2 = new Date(event2.endAt).getTime();
+    return start1 < end2 && start2 < end1;
+  };
+
+  // Calculate layout for overlapping events
+  const calculateEventLayout = React.useCallback((dayEvents: EventRecord[]) => {
+    if (dayEvents.length === 0) return new Map<string, { column: number; totalColumns: number }>();
+
+    // Sort by start time, then by duration (longer events first)
+    const sortedEvents = [...dayEvents].sort((a, b) => {
+      const startDiff = new Date(a.startAt).getTime() - new Date(b.startAt).getTime();
+      if (startDiff !== 0) return startDiff;
+      const durationA = new Date(a.endAt).getTime() - new Date(a.startAt).getTime();
+      const durationB = new Date(b.endAt).getTime() - new Date(b.startAt).getTime();
+      return durationB - durationA;
+    });
+
+    const layoutMap = new Map<string, { column: number; totalColumns: number }>();
+    const columns: EventRecord[][] = [];
+
+    for (const event of sortedEvents) {
+      // Find the first column where this event doesn't overlap with existing events
+      let columnIndex = 0;
+      let placed = false;
+
+      while (!placed) {
+        if (!columns[columnIndex]) {
+          columns[columnIndex] = [];
+        }
+
+        const hasOverlap = columns[columnIndex].some((existingEvent) =>
+          eventsOverlap(event, existingEvent)
+        );
+
+        if (!hasOverlap) {
+          columns[columnIndex].push(event);
+          layoutMap.set(event.id, { column: columnIndex, totalColumns: 0 });
+          placed = true;
+        } else {
+          columnIndex++;
+        }
+      }
+    }
+
+    // Calculate total columns for each event based on its overlap group
+    for (const event of sortedEvents) {
+      const overlappingEvents = sortedEvents.filter((e) => eventsOverlap(event, e));
+      const maxColumn = Math.max(...overlappingEvents.map((e) => layoutMap.get(e.id)?.column ?? 0));
+      const layout = layoutMap.get(event.id);
+      if (layout) {
+        layout.totalColumns = maxColumn + 1;
+      }
+    }
+
+    return layoutMap;
+  }, []);
+
+  // Memoize event layouts for each day
+  const eventLayouts = React.useMemo(() => {
+    const layouts = new Map<string, Map<string, { column: number; totalColumns: number }>>();
+    for (const day of weekDays) {
+      const dayKey = format(day, "yyyy-MM-dd");
+      // Inline getEventsForDay logic to avoid dependency issues
+      const dayEvents = events.filter((event) => {
+        const eventStart = new Date(event.startAt);
+        return isSameDay(eventStart, day);
+      });
+      layouts.set(dayKey, calculateEventLayout(dayEvents));
+    }
+    return layouts;
+  }, [weekDays, events, calculateEventLayout]);
+
+  // Calculate event position and height (relative to the hour slot)
+  const getEventStyle = (event: EventRecord, dayKey: string) => {
     const start = new Date(event.startAt);
     const end = new Date(event.endAt);
-    const dayStart = startOfDay(start);
 
-    const topMinutes = differenceInMinutes(start, dayStart);
+    // Get minutes within the hour (0-59) for top position
+    const minutesInHour = start.getMinutes();
     const durationMinutes = differenceInMinutes(end, start);
 
+    // Get layout info for overlapping events
+    const dayLayout = eventLayouts.get(dayKey);
+    const layout = dayLayout?.get(event.id);
+    const column = layout?.column ?? 0;
+    const totalColumns = layout?.totalColumns ?? 1;
+
+    // Calculate width and left position based on columns
+    const widthPercent = 100 / totalColumns;
+    const leftPercent = column * widthPercent;
+
     return {
-      top: `${topMinutes}px`,
+      top: `${minutesInHour}px`,
       height: `${Math.max(durationMinutes, 30)}px`,
+      width: `calc(${widthPercent}% - 8px)`,
+      left: `calc(${leftPercent}% + 4px)`,
     };
   };
 
@@ -299,19 +458,85 @@ export function PomodoroCalendar() {
 
   const currentTimePosition = getCurrentTimePosition();
 
-  const handleEventClick = (event: EventRecord) => {
-    if (event.isPomodoro) {
-      setSelectedEvent(event);
+  const handleEventClick = (event: EventRecord, e: React.MouseEvent) => {
+    void e; // Suppress unused parameter warning
+
+    // If this is the currently active pomodoro, show timer modal
+    if (activePomodoro && activePomodoro.id === event.id) {
       setTimerModalOpen(true);
+      return;
     }
+
+    // All other events open edit modal
+    setEditingEvent(event);
+    setDialogOpen(true);
+  };
+
+  const handleEventUpdate = async (formData: EventFormData & { id: string }) => {
+    setIsSubmitting(true);
+
+    const payload = {
+      id: formData.id,
+      title: formData.title,
+      description: formData.description || null,
+      startAt: new Date(formData.startAt).toISOString(),
+      endAt: new Date(formData.endAt).toISOString(),
+      color: formData.color || "#EA2831",
+      categoryId: formData.categoryId,
+      isPomodoro: formData.isPomodoro,
+      inputDuration: formData.inputDuration,
+      outputDuration: formData.outputDuration,
+      isRecurring: formData.isRecurring,
+      rrule: formData.rrule,
+    };
+
+    const response = await fetch("/api/events", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as { event: EventRecord };
+      setEvents((prev) =>
+        prev.map((e) => (e.id === data.event.id ? data.event : e))
+      );
+      setDialogOpen(false);
+      setEditingEvent(null);
+    }
+    setIsSubmitting(false);
+  };
+
+  const handleEventDelete = async (eventId: string) => {
+    setIsSubmitting(true);
+
+    const response = await fetch(`/api/events?id=${eventId}`, {
+      method: "DELETE",
+    });
+
+    if (response.ok) {
+      setEvents((prev) => prev.filter((e) => e.id !== eventId));
+      setDialogOpen(false);
+      setEditingEvent(null);
+
+      // If deleting the active pomodoro, stop the timer
+      if (activePomodoro && activePomodoro.id === eventId) {
+        setActivePomodoro(null);
+        setTimerModalOpen(false);
+        setShowBlurtingModal(false);
+        persistentTimer.reset();
+        blurtingSession.resetSession();
+      }
+    }
+    setIsSubmitting(false);
   };
 
   const handleTimerComplete = async (blurtingText: string) => {
-    if (!selectedEvent) return;
+    if (!activePomodoro) return;
 
     // TODO: Save blurting log to database
     console.log("Blurting completed:", {
-      eventId: selectedEvent.id,
+      eventId: activePomodoro.id,
       blurtingText,
     });
   };
@@ -375,16 +600,26 @@ export function PomodoroCalendar() {
           </div>
         </div>
         <div className="flex items-center gap-4">
-          <div className="relative flex items-center bg-muted rounded-lg px-3 py-1.5 w-64">
-            <span className="material-symbols-outlined text-muted-foreground text-lg mr-2">search</span>
-            <input
-              className="bg-transparent border-none focus:ring-0 text-sm p-0 w-full placeholder-muted-foreground focus:outline-none"
-              placeholder="Search events"
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+          {/* Show Mini Timer when pomodoro is active, otherwise show search */}
+          {activePomodoro && persistentTimer.state.phase !== "idle" ? (
+            <MiniTimer
+              remainingSeconds={persistentTimer.state.remainingSeconds}
+              phase={persistentTimer.state.phase}
+              eventTitle={activePomodoro.title}
+              onClick={() => setTimerModalOpen(true)}
             />
-          </div>
+          ) : (
+            <div className="relative flex items-center bg-muted rounded-lg px-3 py-1.5 w-64">
+              <span className="material-symbols-outlined text-muted-foreground text-lg mr-2">search</span>
+              <input
+                className="bg-transparent border-none focus:ring-0 text-sm p-0 w-full placeholder-muted-foreground focus:outline-none"
+                placeholder="Search events"
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
+          )}
           <div className="flex items-center gap-2 border-l border-border pl-4 ml-2">
             <button className="p-2 rounded-full hover:bg-muted transition-colors">
               <span className="material-symbols-outlined">help</span>
@@ -572,6 +807,7 @@ export function PomodoroCalendar() {
                     {formatHour(hour)}
                   </div>
                   {weekDays.map((day, dayIndex) => {
+                    const dayKey = format(day, "yyyy-MM-dd");
                     const dayEvents = getEventsForDay(day).filter((event) => {
                       const eventHour = new Date(event.startAt).getHours();
                       return eventHour === hour;
@@ -584,20 +820,20 @@ export function PomodoroCalendar() {
                         onMouseDown={(e) => handleMouseDown(e, day, hour)}
                       >
                         {dayEvents.map((event) => {
-                          const style = getEventStyle(event);
+                          const style = getEventStyle(event, dayKey);
                           const isPomodoroEvent = event.isPomodoro;
 
                           return (
                             <div
                               key={event.id}
-                              className={`absolute inset-x-1 p-2 rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden cursor-pointer hover:opacity-90 transition-opacity ${isPomodoroEvent
+                              className={`absolute p-2 rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden cursor-pointer hover:opacity-90 transition-opacity ${isPomodoroEvent
                                 ? "bg-primary text-primary-foreground"
                                 : "bg-primary/10 text-primary border-l-4 border-primary"
                                 }`}
                               style={style}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                handleEventClick(event);
+                                handleEventClick(event, e);
                               }}
                               onMouseDown={(e) => e.stopPropagation()}
                             >
@@ -624,14 +860,21 @@ export function PomodoroCalendar() {
         </main>
       </div>
 
-      {/* Create Event Modal */}
+      {/* Create/Edit Event Modal */}
       <EventCreateModal
         isOpen={dialogOpen}
-        onClose={() => setDialogOpen(false)}
+        onClose={() => {
+          setDialogOpen(false);
+          setEditingEvent(null);
+        }}
         onSave={handleEventSave}
+        onUpdate={handleEventUpdate}
+        onDelete={handleEventDelete}
         initialDate={createModalInitialDate}
         initialEndDate={createModalInitialEndDate}
         isSubmitting={isSubmitting}
+        editingEvent={editingEvent}
+        isDeleteOnly={!!(editingEvent && activePomodoro && editingEvent.id === activePomodoro.id)}
       />
 
       {/* Mobile FAB */}
@@ -648,17 +891,43 @@ export function PomodoroCalendar() {
       </div>
 
       {/* Pomodoro Timer Modal */}
-      {selectedEvent && (
+      {activePomodoro && (
         <PomodoroTimerModal
           isOpen={timerModalOpen}
           onClose={() => {
+            // Can only close modal, but timer keeps running in header
             setTimerModalOpen(false);
-            setSelectedEvent(null);
           }}
-          eventTitle={selectedEvent.title}
-          inputDuration={selectedEvent.inputDuration}
-          outputDuration={selectedEvent.outputDuration}
+          eventTitle={activePomodoro.title}
+          inputDuration={activePomodoro.inputDuration}
+          outputDuration={activePomodoro.outputDuration}
           onComplete={handleTimerComplete}
+          eventStartAt={activePomodoro.startAt}
+          eventEndAt={activePomodoro.endAt}
+          timerState={persistentTimer.state}
+        />
+      )}
+
+      {/* Persistent Blurting Modal (shown when in output phase) */}
+      {activePomodoro && showBlurtingModal && persistentTimer.state.phase === "output" && (
+        <BlurtingModal
+          isOpen={true}
+          onClose={() => { }} // Cannot close during blurting
+          onComplete={(text) => {
+            blurtingSession.endSession();
+            setShowBlurtingModal(false);
+            handleTimerComplete(text);
+            // Check if session is done
+            if (persistentTimer.state.phase === "completed") {
+              setActivePomodoro(null);
+              persistentTimer.reset();
+            }
+          }}
+          remainingSeconds={persistentTimer.state.remainingSeconds}
+          totalSeconds={persistentTimer.state.totalSeconds}
+          eventTitle={activePomodoro.title}
+          initialText={blurtingSession.state.blurtingText}
+          canComplete={persistentTimer.state.remainingSeconds <= 0}
         />
       )}
     </div>

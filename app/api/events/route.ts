@@ -9,6 +9,7 @@ type EventPayload = {
   startAt?: string;
   endAt?: string;
   color?: string | null;
+  categoryId?: string | null;
   isPomodoro?: boolean;
   inputDuration?: number;
   outputDuration?: number;
@@ -94,6 +95,7 @@ export async function POST(request: Request) {
       title: body.title,
       description: body.description ?? null,
       color: body.color ?? "#3b82f6",
+      categoryId: body.categoryId ?? null,
       startAt: new Date(body.startAt),
       endAt: new Date(body.endAt),
       isPomodoro: Boolean(body.isPomodoro),
@@ -105,4 +107,73 @@ export async function POST(request: Request) {
   });
 
   return NextResponse.json({ event }, { status: 201 });
+}
+
+export async function PUT(request: Request) {
+  const user = await getAuthenticatedUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const body = (await request.json()) as EventPayload & { id?: string };
+  if (!body.id) {
+    return NextResponse.json({ error: "Event ID is required" }, { status: 400 });
+  }
+
+  // Verify the event belongs to the user
+  const existingEvent = await prisma.event.findFirst({
+    where: { id: body.id, userId: user.id },
+  });
+
+  if (!existingEvent) {
+    return NextResponse.json({ error: "Event not found" }, { status: 404 });
+  }
+
+  const event = await prisma.event.update({
+    where: { id: body.id },
+    data: {
+      title: body.title ?? existingEvent.title,
+      description: body.description !== undefined ? body.description : existingEvent.description,
+      color: body.color ?? existingEvent.color,
+      categoryId: body.categoryId !== undefined ? body.categoryId : existingEvent.categoryId,
+      startAt: body.startAt ? new Date(body.startAt) : existingEvent.startAt,
+      endAt: body.endAt ? new Date(body.endAt) : existingEvent.endAt,
+      isPomodoro: body.isPomodoro !== undefined ? Boolean(body.isPomodoro) : existingEvent.isPomodoro,
+      inputDuration: body.inputDuration ?? existingEvent.inputDuration,
+      outputDuration: body.outputDuration ?? existingEvent.outputDuration,
+      isRecurring: body.isRecurring !== undefined ? Boolean(body.isRecurring) : existingEvent.isRecurring,
+      rrule: body.isRecurring ? (body.rrule ?? existingEvent.rrule) : null,
+    },
+  });
+
+  return NextResponse.json({ event });
+}
+
+export async function DELETE(request: Request) {
+  const user = await getAuthenticatedUser();
+  if (!user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(request.url);
+  const eventId = searchParams.get("id");
+
+  if (!eventId) {
+    return NextResponse.json({ error: "Event ID is required" }, { status: 400 });
+  }
+
+  // Verify the event belongs to the user
+  const existingEvent = await prisma.event.findFirst({
+    where: { id: eventId, userId: user.id },
+  });
+
+  if (!existingEvent) {
+    return NextResponse.json({ error: "Event not found" }, { status: 404 });
+  }
+
+  await prisma.event.delete({
+    where: { id: eventId },
+  });
+
+  return NextResponse.json({ success: true });
 }

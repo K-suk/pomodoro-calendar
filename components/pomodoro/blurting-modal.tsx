@@ -11,17 +11,20 @@ type BlurtingModalProps = {
   totalSeconds: number;
   eventTitle?: string;
   initialText?: string;
+  canComplete?: boolean; // Only allow completion when true (timer finished)
 };
 
 export function BlurtingModal({
   isOpen,
-  onClose,
+  onClose: _onClose, // Intentionally unused - cannot close during blurting
   onComplete,
   remainingSeconds,
   totalSeconds,
   eventTitle,
   initialText = "",
+  canComplete = true, // Default to true for backwards compatibility
 }: BlurtingModalProps) {
+  void _onClose; // Suppress unused variable warning
   const [text, setText] = React.useState(initialText);
   const [isSaving, setIsSaving] = React.useState(false);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
@@ -38,24 +41,29 @@ export function BlurtingModal({
     setText(initialText);
   }, [initialText]);
 
-  // Keyboard shortcut: CMD/Ctrl + Enter to complete
+  const handleComplete = React.useCallback(() => {
+    if (!canComplete) return;
+    onComplete(text);
+    setText("");
+  }, [canComplete, onComplete, text]);
+
+  // Keyboard shortcut: CMD/Ctrl + Enter to complete (only if allowed)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
-        handleComplete();
+        if (canComplete) {
+          handleComplete();
+        }
       }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-      }
+      // Escape is disabled - no escape from blurting!
     };
 
     if (isOpen) {
       window.addEventListener("keydown", handleKeyDown);
       return () => window.removeEventListener("keydown", handleKeyDown);
     }
-  }, [isOpen, text]);
+  }, [isOpen, canComplete, handleComplete]);
 
   // Auto-save simulation
   React.useEffect(() => {
@@ -68,11 +76,6 @@ export function BlurtingModal({
 
     return () => clearTimeout(timer);
   }, [text]);
-
-  const handleComplete = () => {
-    onComplete(text);
-    setText("");
-  };
 
   const progress = totalSeconds > 0 ? ((totalSeconds - remainingSeconds) / totalSeconds) * 100 : 0;
 
@@ -140,42 +143,46 @@ export function BlurtingModal({
               <span>{isSaving ? "Saving..." : "Saved"}</span>
             </div>
             <div className="flex items-center gap-4">
+              {/* No cancel button - must complete the blurting session */}
               <button 
-                className="flex items-center justify-center rounded-lg h-10 px-6 text-muted-foreground text-sm font-medium hover:bg-muted transition-colors"
-                onClick={onClose}
-              >
-                Cancel
-              </button>
-              <button 
-                className="flex min-w-[100px] cursor-pointer items-center justify-center overflow-hidden rounded-lg h-10 px-6 bg-primary/10 text-primary text-sm font-bold leading-normal tracking-wide hover:bg-primary hover:text-primary-foreground transition-all"
+                className={`flex min-w-[100px] items-center justify-center overflow-hidden rounded-lg h-10 px-6 text-sm font-bold leading-normal tracking-wide transition-all ${
+                  canComplete 
+                    ? "cursor-pointer bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground" 
+                    : "cursor-not-allowed bg-muted text-muted-foreground"
+                }`}
                 onClick={handleComplete}
+                disabled={!canComplete}
               >
-                <span className="truncate">Done</span>
+                <span className="truncate">
+                  {canComplete ? "Done" : `Wait ${formatTime(remainingSeconds)}`}
+                </span>
               </button>
             </div>
           </div>
 
-          {/* Close Button */}
-          <button 
-            className="absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors p-1 rounded-full hover:bg-muted"
-            onClick={onClose}
-          >
-            <span className="material-symbols-outlined">close</span>
-          </button>
+          {/* No close button - no escape from blurting! */}
         </div>
       </div>
 
-      {/* Keyboard Shortcut Hint */}
+      {/* Status message */}
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 text-[11px] text-muted-foreground uppercase tracking-[0.2em] font-medium opacity-60">
-        Press{" "}
-        <kbd className="px-1.5 py-0.5 rounded border border-border font-sans text-[10px]">
-          ⌘
-        </kbd>{" "}
-        +{" "}
-        <kbd className="px-1.5 py-0.5 rounded border border-border font-sans text-[10px]">
-          Enter
-        </kbd>{" "}
-        to finish
+        {canComplete ? (
+          <>
+            Press{" "}
+            <kbd className="px-1.5 py-0.5 rounded border border-border font-sans text-[10px]">
+              ⌘
+            </kbd>{" "}
+            +{" "}
+            <kbd className="px-1.5 py-0.5 rounded border border-border font-sans text-[10px]">
+              Enter
+            </kbd>{" "}
+            to finish
+          </>
+        ) : (
+          <span className="text-primary">
+            Keep writing • No escape until timer ends
+          </span>
+        )}
       </div>
     </>
   );

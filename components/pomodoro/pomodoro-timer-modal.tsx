@@ -1,9 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { usePomodoroTimer, calculateProgress, type PomodoroPhase } from "@/hooks/use-pomodoro-timer";
-import { useBlurtingSession } from "@/hooks/use-blurting-session";
-import { BlurtingModal } from "./blurting-modal";
+import { calculateProgress, formatTime, type PomodoroPhase, type PomodoroState } from "@/hooks/use-pomodoro-timer";
 
 type PomodoroTimerModalProps = {
   isOpen: boolean;
@@ -13,121 +11,67 @@ type PomodoroTimerModalProps = {
   outputDuration: number; // minutes
   totalSessions?: number;
   onComplete?: (blurtingText: string) => void;
+  eventStartAt: string; // ISO string
+  eventEndAt: string; // ISO string
+  // External timer state (managed by parent)
+  timerState?: PomodoroState;
 };
+
+// Check if current time is within event time range
+function isWithinEventTime(startAt: string, endAt: string): boolean {
+  const now = new Date().getTime();
+  const start = new Date(startAt).getTime();
+  const end = new Date(endAt).getTime();
+  return now >= start && now <= end;
+}
 
 export function PomodoroTimerModal({
   isOpen,
-  onClose,
+  onClose: _onClose, // Intentionally unused - modal can be closed but timer continues
   eventTitle,
   inputDuration,
   outputDuration,
-  totalSessions = 4,
-  onComplete,
+  totalSessions = 1,
+  eventStartAt,
+  eventEndAt,
+  timerState,
 }: PomodoroTimerModalProps) {
-  const [completedSessions, setCompletedSessions] = React.useState(0);
-  const [showBlurtingModal, setShowBlurtingModal] = React.useState(false);
-  
-  const handlePhaseChange = React.useCallback((phase: PomodoroPhase) => {
-    if (phase === "output") {
-      blurtingSession.startSession();
-      setShowBlurtingModal(true);
-    } else if (phase === "completed") {
-      // Don't auto-close blurting modal, let user finish
-    }
-  }, []);
+  void _onClose; // Suppress unused variable warning
+  const [completedSessions] = React.useState(0);
 
-  const timer = usePomodoroTimer(inputDuration, outputDuration, handlePhaseChange);
-  const blurtingSession = useBlurtingSession();
-
-  // Start timer when modal opens
-  React.useEffect(() => {
-    if (isOpen && timer.state.phase === "idle") {
-      timer.start();
-    }
-  }, [isOpen]);
-
-  // Reset when modal closes
-  React.useEffect(() => {
-    if (!isOpen) {
-      timer.reset();
-      blurtingSession.resetSession();
-      setShowBlurtingModal(false);
-      setCompletedSessions(0);
-    }
-  }, [isOpen]);
-
-  const handleStop = () => {
-    timer.pause();
-    onClose();
+  // Use external timer state if provided, otherwise use defaults
+  const state = timerState ?? {
+    phase: "idle" as PomodoroPhase,
+    remainingSeconds: inputDuration * 60,
+    totalSeconds: inputDuration * 60,
+    isRunning: false,
+    inputDuration,
+    outputDuration,
   };
 
-  const handleReset = () => {
-    timer.reset();
-    blurtingSession.resetSession();
-    setShowBlurtingModal(false);
-    timer.start();
-  };
+  const progress = calculateProgress(state.remainingSeconds, state.totalSeconds);
+  const minutes = Math.floor(state.remainingSeconds / 60);
+  const seconds = state.remainingSeconds % 60;
 
-  const handleSkipToBlurting = () => {
-    timer.skipToOutput();
-  };
-
-  const handleBlurtingComplete = (text: string) => {
-    blurtingSession.endSession();
-    setCompletedSessions((prev) => prev + 1);
-    setShowBlurtingModal(false);
-    onComplete?.(text);
-    
-    // If more sessions remaining, restart timer
-    if (completedSessions + 1 < totalSessions) {
-      timer.reset();
-      timer.start();
-    } else {
-      onClose();
-    }
-  };
-
-  const handleBlurtingClose = () => {
-    setShowBlurtingModal(false);
-    timer.pause();
-  };
-
-  const progress = calculateProgress(timer.state.remainingSeconds, timer.state.totalSeconds);
-  const minutes = Math.floor(timer.state.remainingSeconds / 60);
-  const seconds = timer.state.remainingSeconds % 60;
-
-  const phaseLabel = timer.state.phase === "input" 
+  const phaseLabel = state.phase === "input" 
     ? "Focus Session" 
-    : timer.state.phase === "output" 
+    : state.phase === "output" 
     ? "Blurting Time" 
-    : timer.state.phase === "completed"
+    : state.phase === "completed"
     ? "Session Complete"
     : "Ready";
 
+  // Check if we're within the event time
+  const withinEventTime = isWithinEventTime(eventStartAt, eventEndAt);
+
   if (!isOpen) return null;
 
-  // Show Blurting Modal during output phase
-  if (showBlurtingModal && timer.state.phase === "output") {
-    return (
-      <BlurtingModal
-        isOpen={true}
-        onClose={handleBlurtingClose}
-        onComplete={handleBlurtingComplete}
-        remainingSeconds={timer.state.remainingSeconds}
-        totalSeconds={timer.state.totalSeconds}
-        eventTitle={eventTitle}
-        initialText={blurtingSession.state.blurtingText}
-      />
-    );
-  }
+  // Note: Blurting modal is now handled by parent component
 
   return (
     <div className="fixed inset-0 z-50">
-      {/* Overlay */}
-      <div 
-        className="fixed inset-0 bg-black/40 backdrop-blur-sm"
-        onClick={handleStop}
-      />
+      {/* Overlay - no click to close */}
+      <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" />
       
       {/* Modal */}
       <div className="fixed inset-0 flex items-center justify-center pointer-events-none">
@@ -149,6 +93,18 @@ export function PomodoroTimerModal({
               </p>
             </div>
 
+            {/* Not within event time warning */}
+            {!withinEventTime && state.phase === "idle" && (
+              <div className="mb-6 p-4 bg-destructive/10 rounded-lg text-center">
+                <p className="text-sm text-destructive font-medium">
+                  Timer will start at scheduled time
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {new Date(eventStartAt).toLocaleTimeString()} - {new Date(eventEndAt).toLocaleTimeString()}
+                </p>
+              </div>
+            )}
+
             {/* Timer Display */}
             <div className="flex items-center justify-center py-6">
               <span className="text-[100px] font-extralight leading-none tracking-tighter">
@@ -162,45 +118,16 @@ export function PomodoroTimerModal({
               </span>
             </div>
 
-            {/* Skip to Blurting Button (only during input phase) */}
-            {timer.state.phase === "input" && (
-              <button
-                className="text-xs text-muted-foreground hover:text-primary transition-colors mb-4"
-                onClick={handleSkipToBlurting}
-              >
-                Skip to blurting →
-              </button>
-            )}
-
-            {/* Control Bar */}
-            <div className="flex items-center justify-between w-full mt-8 px-4">
-              {/* Stop Button */}
-              <button 
-                className="text-muted-foreground hover:text-primary transition-colors text-sm font-bold tracking-widest px-4 py-2"
-                onClick={handleStop}
-              >
-                STOP
-              </button>
-
-              {/* Session Dots */}
-              <div className="flex gap-2">
-                {Array.from({ length: totalSessions }).map((_, i) => (
-                  <div
-                    key={i}
-                    className={`size-1.5 rounded-full transition-colors ${
-                      i < completedSessions ? "bg-primary" : "bg-muted"
-                    }`}
-                  />
-                ))}
-              </div>
-
-              {/* Reset Button */}
-              <button 
-                className="size-10 flex items-center justify-center text-muted-foreground hover:bg-muted rounded-full transition-all"
-                onClick={handleReset}
-              >
-                <span className="material-symbols-outlined text-[20px]">refresh</span>
-              </button>
+            {/* Session Progress */}
+            <div className="flex items-center justify-center gap-2 mt-4">
+              {Array.from({ length: totalSessions }).map((_, i) => (
+                <div
+                  key={i}
+                  className={`size-2 rounded-full transition-colors ${
+                    i < completedSessions ? "bg-primary" : "bg-muted"
+                  }`}
+                />
+              ))}
             </div>
 
             {/* Event Title */}
@@ -209,9 +136,49 @@ export function PomodoroTimerModal({
                 {eventTitle}
               </p>
             </div>
+
+            {/* No escape message */}
+            <div className="mt-6 text-center">
+              <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
+                Stay focused • No escape
+              </p>
+            </div>
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+// Export for use in header persistent timer
+export function MiniTimer({ 
+  remainingSeconds, 
+  phase, 
+  eventTitle,
+  onClick 
+}: { 
+  remainingSeconds: number; 
+  phase: PomodoroPhase;
+  eventTitle: string;
+  onClick: () => void;
+}) {
+  const timeDisplay = formatTime(remainingSeconds);
+  const phaseColor = phase === "input" ? "text-primary" : phase === "output" ? "text-amber-500" : "text-muted-foreground";
+
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-3 bg-primary/10 hover:bg-primary/20 px-4 py-2 rounded-lg transition-colors"
+    >
+      <span className="material-symbols-outlined text-primary text-lg animate-pulse">timer</span>
+      <div className="flex flex-col items-start">
+        <span className={`font-mono text-lg font-bold ${phaseColor}`}>
+          {timeDisplay}
+        </span>
+        <span className="text-[10px] text-muted-foreground truncate max-w-[120px]">
+          {eventTitle}
+        </span>
+      </div>
+    </button>
   );
 }

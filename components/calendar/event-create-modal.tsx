@@ -2,14 +2,37 @@
 
 import * as React from "react";
 import { format, differenceInMinutes } from "date-fns";
+import { RecurrencePicker, type RecurrenceConfig, generateRRule } from "./recurrence-picker";
+import { CategoryPicker, type Category } from "./category-picker";
+import { CategoryCreateModal } from "./category-create-modal";
+import { CategoryEditModal } from "./category-edit-modal";
+
+type EventRecord = {
+  id: string;
+  title: string;
+  description: string | null;
+  color: string | null;
+  categoryId: string | null;
+  startAt: string;
+  endAt: string;
+  isPomodoro: boolean;
+  inputDuration: number;
+  outputDuration: number;
+  isRecurring: boolean;
+  rrule: string | null;
+};
 
 type EventCreateModalProps = {
   isOpen: boolean;
   onClose: () => void;
   onSave: (event: EventFormData) => void;
+  onUpdate?: (event: EventFormData & { id: string }) => void;
+  onDelete?: (eventId: string) => void;
   initialDate?: Date;
   initialEndDate?: Date;
   isSubmitting?: boolean;
+  editingEvent?: EventRecord | null;
+  isDeleteOnly?: boolean; // When true, only delete is allowed (for active pomodoro)
 };
 
 export type EventFormData = {
@@ -22,17 +45,12 @@ export type EventFormData = {
   outputDuration: number;
   longBreakDuration: number;
   sets: number;
-  category: string;
+  categoryId: string | null;
   color: string;
   isRecurring: boolean;
+  recurrence: RecurrenceConfig;
+  rrule: string | null;
 };
-
-const CATEGORIES = [
-  { id: "break", label: "Break", color: "#86efac" },
-  { id: "exam", label: "Test/Exam", color: "#ef4444" },
-  { id: "meeting", label: "Meeting", color: "#2563eb" },
-  { id: "work", label: "Deep Work", color: "#374151" },
-];
 
 // Standard cycle: 20 min focus + 5 min blurting + 5 min break = 30 min
 const STANDARD_CYCLE_DURATION = 30;
@@ -81,11 +99,24 @@ export function EventCreateModal({
   isOpen,
   onClose,
   onSave,
+  onUpdate,
+  onDelete,
   initialDate,
   initialEndDate,
   isSubmitting = false,
+  editingEvent,
+  isDeleteOnly = false,
 }: EventCreateModalProps) {
+  const isEditMode = !!editingEvent;
   const [eventType, setEventType] = React.useState<"pomodoro" | "normal">("pomodoro");
+  const [showDeleteConfirm, setShowDeleteConfirm] = React.useState(false);
+  const [categories, setCategories] = React.useState<Category[]>([]);
+  const [isLoadingCategories, setIsLoadingCategories] = React.useState(false);
+  const [showCategoryCreateModal, setShowCategoryCreateModal] = React.useState(false);
+  const [isCreatingCategory, setIsCreatingCategory] = React.useState(false);
+  const [editingCategory, setEditingCategory] = React.useState<Category | null>(null);
+  const [isEditingCategory, setIsEditingCategory] = React.useState(false);
+  
   const [formState, setFormState] = React.useState<EventFormData>({
     title: "",
     description: "",
@@ -96,10 +127,34 @@ export function EventCreateModal({
     outputDuration: 5,
     longBreakDuration: 15,
     sets: 1,
-    category: "work",
+    categoryId: null,
     color: "#374151",
     isRecurring: false,
+    recurrence: { type: "none" },
+    rrule: null,
   });
+
+  // Load categories
+  React.useEffect(() => {
+    const loadCategories = async () => {
+      setIsLoadingCategories(true);
+      try {
+        const response = await fetch("/api/categories");
+        if (response.ok) {
+          const data = (await response.json()) as { categories: Category[] };
+          setCategories(data.categories);
+        }
+      } catch (error) {
+        console.error("Failed to load categories:", error);
+      } finally {
+        setIsLoadingCategories(false);
+      }
+    };
+    
+    if (isOpen) {
+      void loadCategories();
+    }
+  }, [isOpen]);
 
   // Calculate event duration in minutes
   const eventDurationMinutes = React.useMemo(() => {
@@ -167,6 +222,29 @@ export function EventCreateModal({
     }
   }, [eventDurationMinutes, eventType, isPomodoroTimeValid]);
 
+  // Populate form when editing an event
+  React.useEffect(() => {
+    if (editingEvent && isOpen) {
+      setFormState({
+        title: editingEvent.title,
+        description: editingEvent.description || "",
+        startAt: format(new Date(editingEvent.startAt), "yyyy-MM-dd'T'HH:mm"),
+        endAt: format(new Date(editingEvent.endAt), "yyyy-MM-dd'T'HH:mm"),
+        isPomodoro: editingEvent.isPomodoro,
+        inputDuration: editingEvent.inputDuration,
+        outputDuration: editingEvent.outputDuration,
+        longBreakDuration: 15,
+        sets: 1,
+        categoryId: editingEvent.categoryId || null,
+        color: editingEvent.color || "#374151",
+        isRecurring: editingEvent.isRecurring,
+        recurrence: editingEvent.isRecurring ? { type: "weekly" } : { type: "none" }, // TODO: Parse rrule
+        rrule: editingEvent.rrule,
+      });
+      setEventType(editingEvent.isPomodoro ? "pomodoro" : "normal");
+    }
+  }, [editingEvent, isOpen]);
+
   // Reset form when modal closes
   React.useEffect(() => {
     if (!isOpen) {
@@ -180,28 +258,120 @@ export function EventCreateModal({
         outputDuration: 5,
         longBreakDuration: 15,
         sets: 1,
-        category: "work",
+        categoryId: null,
         color: "#374151",
         isRecurring: false,
+        recurrence: { type: "none" },
+        rrule: null,
       });
       setEventType("pomodoro");
+      setShowDeleteConfirm(false);
     }
   }, [isOpen]);
+
+  const handleCategorySelect = (categoryId: string) => {
+    const category = categories.find((c) => c.id === categoryId);
+    setFormState((prev) => ({
+      ...prev,
+      categoryId,
+      color: category?.color || prev.color,
+    }));
+  };
+
+  const handleCreateCategory = async (title: string, color: string) => {
+    setIsCreatingCategory(true);
+    try {
+      const response = await fetch("/api/categories", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, color }),
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as { category: Category };
+        setCategories((prev) => [...prev, data.category]);
+        setFormState((prev) => ({
+          ...prev,
+          categoryId: data.category.id,
+          color: data.category.color,
+        }));
+        setShowCategoryCreateModal(false);
+      }
+    } catch (error) {
+      console.error("Failed to create category:", error);
+    } finally {
+      setIsCreatingCategory(false);
+    }
+  };
+
+  const handleEditCategory = (category: Category) => {
+    setEditingCategory(category);
+  };
+
+  const handleUpdateCategory = async (id: string, title: string, color: string) => {
+    setIsEditingCategory(true);
+    try {
+      const response = await fetch("/api/categories", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, title, color }),
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as { category: Category };
+        setCategories((prev) =>
+          prev.map((c) => (c.id === id ? data.category : c))
+        );
+        
+        // If this category is currently selected, update the form state
+        if (formState.categoryId === id) {
+          setFormState((prev) => ({
+            ...prev,
+            color: data.category.color,
+          }));
+        }
+        
+        setEditingCategory(null);
+      }
+    } catch (error) {
+      console.error("Failed to update category:", error);
+    } finally {
+      setIsEditingCategory(false);
+    }
+  };
+
+  const handleDeleteCategory = async (id: string) => {
+    setIsEditingCategory(true);
+    try {
+      const response = await fetch(`/api/categories?id=${id}`, {
+        method: "DELETE",
+      });
+
+      if (response.ok) {
+        setCategories((prev) => prev.filter((c) => c.id !== id));
+        
+        // If this category was selected, clear the selection
+        if (formState.categoryId === id) {
+          setFormState((prev) => ({
+            ...prev,
+            categoryId: null,
+          }));
+        }
+        
+        setEditingCategory(null);
+      }
+    } catch (error) {
+      console.error("Failed to delete category:", error);
+    } finally {
+      setIsEditingCategory(false);
+    }
+  };
 
   const handleEventTypeChange = (type: "pomodoro" | "normal") => {
     setEventType(type);
     setFormState((prev) => ({
       ...prev,
       isPomodoro: type === "pomodoro",
-    }));
-  };
-
-  const handleCategorySelect = (categoryId: string) => {
-    const category = CATEGORIES.find((c) => c.id === categoryId);
-    setFormState((prev) => ({
-      ...prev,
-      category: categoryId,
-      color: category?.color || "#374151",
     }));
   };
 
@@ -223,7 +393,37 @@ export function EventCreateModal({
   const handleSubmit = () => {
     if (!formState.title || !formState.startAt || !formState.endAt) return;
     if (eventType === "pomodoro" && !isPomodoroTimeValid) return;
-    onSave(formState);
+    
+    // Generate RRULE from recurrence config
+    const startDate = new Date(formState.startAt);
+    const rrule = generateRRule(formState.recurrence, startDate);
+    const isRecurring = formState.recurrence.type !== "none";
+    
+    const formDataWithRrule = {
+      ...formState,
+      isRecurring,
+      rrule,
+    };
+    
+    if (isEditMode && editingEvent && onUpdate) {
+      onUpdate({ ...formDataWithRrule, id: editingEvent.id });
+    } else {
+      onSave(formDataWithRrule);
+    }
+  };
+
+  const handleRecurrenceChange = (recurrence: RecurrenceConfig) => {
+    setFormState((prev) => ({
+      ...prev,
+      recurrence,
+      isRecurring: recurrence.type !== "none",
+    }));
+  };
+
+  const handleDelete = () => {
+    if (editingEvent && onDelete) {
+      onDelete(editingEvent.id);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -239,6 +439,95 @@ export function EventCreateModal({
 
   if (!isOpen) return null;
 
+  // Delete-only mode for active pomodoro
+  if (isDeleteOnly && editingEvent) {
+    return (
+      <div 
+        className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50"
+        onKeyDown={handleKeyDown}
+      >
+        <div className="bg-card w-full max-w-[400px] rounded-xl shadow-2xl overflow-hidden flex flex-col border border-border">
+          {/* Header */}
+          <div className="flex items-center justify-between px-6 pt-4 pb-2">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-primary animate-pulse">timer</span>
+              <span className="text-sm font-medium text-muted-foreground">Pomodoro in Progress</span>
+            </div>
+            <button 
+              className="p-2 hover:bg-muted rounded-full transition-colors"
+              onClick={onClose}
+            >
+              <span className="material-symbols-outlined text-muted-foreground">close</span>
+            </button>
+          </div>
+
+          {/* Content */}
+          <div className="px-6 py-6">
+            <h3 className="text-xl font-bold mb-2">{editingEvent.title}</h3>
+            <p className="text-sm text-muted-foreground mb-4">
+              {format(new Date(editingEvent.startAt), "h:mm a")} - {format(new Date(editingEvent.endAt), "h:mm a")}
+            </p>
+            
+            <div className="p-4 bg-amber-500/10 border border-amber-500/20 rounded-lg mb-6">
+              <div className="flex items-start gap-3">
+                <span className="material-symbols-outlined text-amber-500">info</span>
+                <div>
+                  <p className="text-sm font-medium text-amber-600">Timer is running</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    This event cannot be edited while the pomodoro timer is active. You can only delete it.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <button
+              className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-destructive text-destructive-foreground rounded-lg font-medium hover:bg-destructive/90 transition-colors"
+              onClick={() => setShowDeleteConfirm(true)}
+            >
+              <span className="material-symbols-outlined text-lg">delete</span>
+              Delete Event
+            </button>
+          </div>
+        </div>
+
+        {/* Delete Confirmation Dialog */}
+        {showDeleteConfirm && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60]">
+            <div className="bg-card rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl border border-border">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
+                  <span className="material-symbols-outlined text-destructive">warning</span>
+                </div>
+                <h3 className="text-lg font-semibold">Delete Event</h3>
+              </div>
+              <p className="text-muted-foreground mb-6">
+                Are you sure you want to delete &quot;{editingEvent.title}&quot;? This will also stop the running timer. This action cannot be undone.
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button
+                  className="px-4 py-2 text-sm font-medium rounded-lg hover:bg-muted transition-colors"
+                  onClick={() => setShowDeleteConfirm(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
+                  onClick={() => {
+                    handleDelete();
+                    setShowDeleteConfirm(false);
+                  }}
+                  disabled={isSubmitting}
+                >
+                  {isSubmitting ? "Deleting..." : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div 
       className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50"
@@ -249,8 +538,20 @@ export function EventCreateModal({
         <div className="flex items-center justify-between px-6 pt-4 pb-2">
           <div className="flex items-center gap-2">
             <span className="material-symbols-outlined text-muted-foreground">drag_handle</span>
+            {isEditMode && (
+              <span className="text-sm font-medium text-muted-foreground">Edit Task</span>
+            )}
           </div>
           <div className="flex items-center gap-2">
+            {isEditMode && onDelete && (
+              <button 
+                className="p-2 hover:bg-destructive/10 rounded-full transition-colors group"
+                onClick={() => setShowDeleteConfirm(true)}
+                title="Delete event"
+              >
+                <span className="material-symbols-outlined text-muted-foreground group-hover:text-destructive">delete</span>
+              </button>
+            )}
             <button 
               className="p-2 hover:bg-muted rounded-full transition-colors"
               onClick={onClose}
@@ -334,21 +635,11 @@ export function EventCreateModal({
 
               {/* Repeat Option */}
               <div className="flex items-center gap-4 group ml-14">
-                <button
-                  className={`flex items-center gap-2 px-3 py-1.5 rounded border cursor-pointer transition-colors ${
-                    formState.isRecurring
-                      ? "bg-primary/10 border-primary text-primary"
-                      : "bg-muted/50 border-border text-muted-foreground hover:bg-muted"
-                  }`}
-                  onClick={() => setFormState((prev) => ({ ...prev, isRecurring: !prev.isRecurring }))}
-                >
-                  <span className="text-xs font-medium">
-                    {formState.isRecurring ? "Repeats weekly" : "Does not repeat"}
-                  </span>
-                  <span className="material-symbols-outlined text-[16px]">
-                    {formState.isRecurring ? "check" : "expand_more"}
-                  </span>
-                </button>
+                <RecurrencePicker
+                  value={formState.recurrence}
+                  onChange={handleRecurrenceChange}
+                  startDate={formState.startAt ? new Date(formState.startAt) : undefined}
+                />
               </div>
             </div>
 
@@ -538,30 +829,15 @@ export function EventCreateModal({
                   <span className="text-sm font-medium">Category</span>
                 </div>
               </div>
-              <div className="flex flex-wrap gap-2 ml-14">
-                {CATEGORIES.map((category) => (
-                  <button
-                    key={category.id}
-                    className={`flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all ${
-                      formState.category === category.id
-                        ? "border-2 border-primary bg-primary/5 shadow-sm"
-                        : "border-border bg-card hover:bg-muted"
-                    }`}
-                    onClick={() => handleCategorySelect(category.id)}
-                  >
-                    <span
-                      className="w-2.5 h-2.5 rounded-full"
-                      style={{ backgroundColor: category.color }}
-                    />
-                    <span
-                      className={`text-xs ${
-                        formState.category === category.id ? "font-bold" : "font-medium"
-                      }`}
-                    >
-                      {category.label}
-                    </span>
-                  </button>
-                ))}
+              <div className="ml-14">
+                <CategoryPicker
+                  categories={categories}
+                  selectedCategoryId={formState.categoryId}
+                  onSelect={handleCategorySelect}
+                  onCreateCategory={() => setShowCategoryCreateModal(true)}
+                  onEditCategory={handleEditCategory}
+                  isLoading={isLoadingCategories}
+                />
               </div>
             </div>
 
@@ -594,10 +870,63 @@ export function EventCreateModal({
             onClick={handleSubmit}
             disabled={isSubmitting || !formState.title || (eventType === "pomodoro" && !isPomodoroTimeValid)}
           >
-            {isSubmitting ? "Saving..." : "Save Task"}
+            {isSubmitting ? "Saving..." : isEditMode ? "Update Task" : "Save Task"}
           </button>
         </div>
       </div>
+
+      {/* Delete Confirmation Dialog */}
+      {showDeleteConfirm && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60]">
+          <div className="bg-card rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl border border-border">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-full bg-destructive/10 flex items-center justify-center">
+                <span className="material-symbols-outlined text-destructive">warning</span>
+              </div>
+              <h3 className="text-lg font-semibold">Delete Event</h3>
+            </div>
+            <p className="text-muted-foreground mb-6">
+              Are you sure you want to delete &quot;{editingEvent?.title}&quot;? This action cannot be undone.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                className="px-4 py-2 text-sm font-medium rounded-lg hover:bg-muted transition-colors"
+                onClick={() => setShowDeleteConfirm(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="px-4 py-2 text-sm font-medium rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
+                onClick={() => {
+                  handleDelete();
+                  setShowDeleteConfirm(false);
+                }}
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Category Create Modal */}
+      <CategoryCreateModal
+        isOpen={showCategoryCreateModal}
+        onClose={() => setShowCategoryCreateModal(false)}
+        onSave={handleCreateCategory}
+        isSubmitting={isCreatingCategory}
+      />
+
+      {/* Category Edit Modal */}
+      <CategoryEditModal
+        isOpen={!!editingCategory}
+        onClose={() => setEditingCategory(null)}
+        onSave={handleUpdateCategory}
+        onDelete={handleDeleteCategory}
+        category={editingCategory}
+        isSubmitting={isEditingCategory}
+      />
     </div>
   );
 }
