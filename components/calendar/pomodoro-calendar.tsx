@@ -58,12 +58,20 @@ type EventRecord = {
   rrule: string | null;
 };
 
+
+type DragMode = 'create' | 'move' | 'resize';
+
 type DragState = {
   isDragging: boolean;
+  mode: DragMode;
   startDay: Date | null;
   startMinutes: number;
   currentDay: Date | null;
   currentMinutes: number;
+  activeEventId: string | null;
+  initialEventStart: Date | null;
+  initialEventEnd: Date | null;
+  dragOffsetMinutes: number;
 };
 
 const HOURS = Array.from({ length: 24 }, (_, i) => i);
@@ -91,6 +99,8 @@ export function PomodoroCalendar() {
   const [editingEvent, setEditingEvent] = React.useState<EventRecord | null>(null);
   const [createModalInitialDate, setCreateModalInitialDate] = React.useState<Date | undefined>();
   const [createModalInitialEndDate, setCreateModalInitialEndDate] = React.useState<Date | undefined>();
+  const [now, setNow] = React.useState(new Date());
+
 
   // Active pomodoro session state (persists even when modal is closed)
   const [activePomodoro, setActivePomodoro] = React.useState<EventRecord | null>(null);
@@ -110,7 +120,8 @@ export function PomodoroCalendar() {
   const persistentTimer = usePomodoroTimer(
     activePomodoro?.inputDuration ?? 25,
     activePomodoro?.outputDuration ?? 5,
-    handlePhaseChange
+    handlePhaseChange,
+    activePomodoro?.id // Pass event ID for persistence
   );
 
   // Check for active pomodoro every second
@@ -138,21 +149,62 @@ export function PomodoroCalendar() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events, activePomodoro, persistentTimer.state.phase]);
 
-  // Start timer when activePomodoro is set
+  // Start timer when activePomodoro is set AND timer is not already running
   React.useEffect(() => {
-    if (activePomodoro && persistentTimer.state.phase === "idle") {
-      persistentTimer.start();
+    if (activePomodoro && persistentTimer.state.phase === "idle" && !persistentTimer.state.isRunning) {
+      // DEBUG: Log the actual duration values
+      console.log('Starting timer with:', {
+        eventTitle: activePomodoro.title,
+        inputDuration: activePomodoro.inputDuration,
+        outputDuration: activePomodoro.outputDuration,
+        eventStart: activePomodoro.startAt,
+        eventEnd: activePomodoro.endAt,
+      });
+      // Pass explicit durations to avoid stale closure issues
+      persistentTimer.start(activePomodoro.inputDuration, activePomodoro.outputDuration);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePomodoro, persistentTimer.state.phase]);
+  }, [activePomodoro, persistentTimer.state.phase, persistentTimer.state.isRunning]);
 
   // Drag state
+  interface DragState {
+    isDragging: boolean;
+    mode: 'create' | 'move' | 'resize';
+    startDay: Date | null;
+    startMinutes: number;
+    currentDay: Date | null;
+    currentMinutes: number;
+    activeEventId: string | null;
+    initialEventStart: Date | null;
+    initialEventEnd: Date | null;
+    dragOffsetMinutes: number;
+    startX?: number;
+    startY?: number;
+  }
+
   const [dragState, setDragState] = React.useState<DragState>({
     isDragging: false,
+    mode: 'create',
     startDay: null,
     startMinutes: 0,
     currentDay: null,
     currentMinutes: 0,
+    activeEventId: null,
+    initialEventStart: null,
+    initialEventEnd: null,
+    dragOffsetMinutes: 0,
+    startX: 0,
+    startY: 0,
+  });
+
+  // Refs for performance optimization (mutable drag state)
+  const dragPreviewRef = React.useRef<HTMLDivElement>(null);
+  const dragDataRef = React.useRef<{
+    currentMinutes: number;
+    currentDay: Date | null;
+  }>({
+    currentMinutes: 0,
+    currentDay: null,
   });
 
   const weekStart = startOfWeek(currentDate, { weekStartsOn: 0 });
@@ -167,17 +219,20 @@ export function PomodoroCalendar() {
   const miniCalendarDays = eachDayOfInterval({ start: miniCalendarStart, end: miniCalendarEnd });
 
   // Load events
+  const weekStartISO = weekStart.toISOString();
+  const weekEndISO = weekEnd.toISOString();
+
   const loadEvents = React.useCallback(async () => {
     const params = new URLSearchParams({
-      start: weekStart.toISOString(),
-      end: weekEnd.toISOString(),
+      start: weekStartISO,
+      end: weekEndISO,
     });
 
     const response = await fetch(`/api/events?${params.toString()}`);
     if (!response.ok) return;
     const payload = (await response.json()) as { events: EventRecord[] };
     setEvents(payload.events ?? []);
-  }, [weekStart, weekEnd]);
+  }, [weekStartISO, weekEndISO]);
 
   React.useEffect(() => {
     void loadEvents();
@@ -186,10 +241,18 @@ export function PomodoroCalendar() {
   // Scroll to current time on mount
   React.useEffect(() => {
     if (scrollContainerRef.current) {
-      const now = new Date();
-      const scrollTop = now.getHours() * SLOT_HEIGHT - 100;
+      const initialNow = new Date();
+      const scrollTop = initialNow.getHours() * SLOT_HEIGHT - 100;
       scrollContainerRef.current.scrollTop = Math.max(0, scrollTop);
     }
+  }, []);
+
+  // Update 'now' every minute
+  React.useEffect(() => {
+    const timer = setInterval(() => {
+      setNow(new Date());
+    }, 60000);
+    return () => clearInterval(timer);
   }, []);
 
   const goToToday = () => {
@@ -227,67 +290,363 @@ export function PomodoroCalendar() {
     // Clamp to valid range (0 to 24 hours)
     const clampedStartMinutes = Math.max(0, Math.min(24 * 60 - 15, startMinutes));
 
+    // Init update ref
+    dragDataRef.current = {
+      currentMinutes: clampedStartMinutes + 30,
+      currentDay: day,
+    };
+
     setDragState({
       isDragging: true,
+      mode: 'create',
       startDay: day,
       startMinutes: clampedStartMinutes,
       currentDay: day,
       currentMinutes: clampedStartMinutes + 30, // Default 30 min
+      activeEventId: null,
+      initialEventStart: null,
+      initialEventEnd: null,
+      dragOffsetMinutes: 0,
+    });
+  };
+
+  // Handle mouse down on event (for move)
+  const handleEventMouseDown = (e: React.MouseEvent, event: EventRecord, day: Date) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+
+    const start = new Date(event.startAt);
+    const end = new Date(event.endAt);
+
+    // Calculate offset from event start
+    const slotElement = (e.target as HTMLElement).closest('.time-slot');
+    if (!slotElement) return;
+
+    const rect = slotElement.getBoundingClientRect();
+    const offsetY = e.clientY - rect.top;
+    const clickHour = parseInt(slotElement.parentElement?.querySelector('.time-label')?.textContent || "0"); // Rough estimation, better to use passed data if possible
+
+    // Better approach: calculate based on the mouse position relative to the grid
+    // But we can just use the event start time vs mouse time calculated in mouse move/down
+    // For now, let's calculate the minute difference between click time and event start time
+
+    // Actually, we can just use the exact start time of the event
+    // and when dragging, we apply the delta
+
+    // Let's use the mouse position to get "click minutes"
+    if (!gridRef.current) return;
+    const gridRect = gridRef.current.getBoundingClientRect();
+    const relativeY = e.clientY - gridRect.top;
+    const clickMinutes = Math.round(relativeY / 15) * 15;
+
+    // Calculate offset
+    const eventStartMinutes = start.getHours() * 60 + start.getMinutes();
+    const dragOffsetMinutes = clickMinutes - eventStartMinutes;
+
+    // Init update ref
+    dragDataRef.current = {
+      currentMinutes: eventStartMinutes,
+      currentDay: day,
+    };
+
+    setDragState({
+      isDragging: false, // Wait for threshold
+      mode: 'move',
+      startDay: day, // This acts as the "anchor" day
+      startMinutes: eventStartMinutes,
+      currentDay: day,
+      currentMinutes: eventStartMinutes,
+      activeEventId: event.id,
+      initialEventStart: start,
+      initialEventEnd: end,
+      dragOffsetMinutes: dragOffsetMinutes,
+      startX: e.clientX,
+      startY: e.clientY,
+    });
+  };
+
+  // Handle mouse down on resize handle
+  const handleResizeMouseDown = (e: React.MouseEvent, event: EventRecord, day: Date) => {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+
+    const start = new Date(event.startAt);
+    const end = new Date(event.endAt);
+    const startMinutes = start.getHours() * 60 + start.getMinutes();
+    const endMinutes = end.getHours() * 60 + end.getMinutes();
+
+    // Init update ref
+    dragDataRef.current = {
+      currentMinutes: endMinutes,
+      currentDay: day,
+    };
+
+    setDragState({
+      isDragging: false, // Wait for threshold
+      mode: 'resize',
+      startDay: day,
+      startMinutes: startMinutes,
+      currentDay: day,
+      currentMinutes: endMinutes,
+      activeEventId: event.id,
+      initialEventStart: start,
+      initialEventEnd: end,
+      dragOffsetMinutes: 0,
+      startX: e.clientX,
+      startY: e.clientY,
     });
   };
 
   // Handle mouse move
   const handleMouseMove = React.useCallback((e: MouseEvent) => {
-    if (!dragState.isDragging || !gridRef.current) return;
+    // If not dragging and no active event pending, return
+    if ((!dragState.isDragging && !dragState.activeEventId && dragState.mode !== 'create') || !gridRef.current) return;
+
+    // Check threshold for move/resize if not yet dragging
+    if (!dragState.isDragging && (dragState.mode === 'move' || dragState.mode === 'resize')) {
+      const dx = e.clientX - (dragState.startX || 0);
+      const dy = e.clientY - (dragState.startY || 0);
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      if (distance < 5) return; // Threshold not met
+
+      // Start dragging - triggers ONE re-render to show preview
+      setDragState(prev => ({ ...prev, isDragging: true }));
+      // Stop here for this frame, let the re-render happen so the ref is attached
+      return;
+    }
 
     const grid = gridRef.current;
     const gridRect = grid.getBoundingClientRect();
 
     // Calculate Y position relative to the grid
-    // gridRect.top already accounts for scroll position (it's viewport-relative)
     const relativeY = e.clientY - gridRect.top;
 
     // Convert to minutes (1px = 1 minute in our grid) and round to 15 min
     const minutes = Math.round(relativeY / 15) * 15;
-
-    // Clamp minutes to valid range (0 to 24 hours)
     const clampedMinutes = Math.max(0, Math.min(24 * 60, minutes));
 
-    setDragState((prev) => ({
-      ...prev,
-      currentMinutes: Math.max(clampedMinutes, prev.startMinutes + 15), // Minimum 15 min
-    }));
-  }, [dragState.isDragging]);
+    // Calculate current day index based on X position
+    const dayWidth = (gridRect.width - 64) / 7; // 64px is time label width
+    const mouseX = e.clientX - gridRect.left - 64;
+    const dayIndex = Math.floor(mouseX / dayWidth);
+    const clampedDayIndex = Math.max(0, Math.min(6, dayIndex));
+    const newDay = weekDays[clampedDayIndex];
+
+    // Update refs
+    dragDataRef.current = {
+      currentMinutes: dragState.mode === 'move'
+        ? Math.round((clampedMinutes - dragState.dragOffsetMinutes) / 15) * 15
+        : (dragState.mode === 'resize'
+          ? Math.max(dragState.startMinutes + 15, clampedMinutes)
+          : clampedMinutes),
+      currentDay: newDay
+    };
+
+    // --- Direct DOM Manipulation ---
+    if (dragPreviewRef.current) {
+      const el = dragPreviewRef.current;
+      const data = dragDataRef.current;
+
+      // Update Position/Size
+      if (dragState.mode === 'create') {
+        const start = Math.min(dragState.startMinutes, data.currentMinutes);
+        const end = Math.max(dragState.startMinutes, data.currentMinutes);
+        el.style.top = `${start}px`;
+        el.style.height = `${end - start}px`;
+        el.style.left = `calc(64px + ${clampedDayIndex} * ((100% - 64px) / 7) + 4px)`;
+
+        // Text Update
+        const textEl = el.querySelector('.time-display');
+        if (textEl && dragState.startDay) {
+          textEl.textContent = `${format(addMinutes(startOfDay(dragState.startDay), start), "h:mm a")} - ${format(addMinutes(startOfDay(dragState.startDay), end), "h:mm a")}`;
+        }
+
+      } else if (dragState.mode === 'move') {
+        const duration = differenceInMinutes(dragState.initialEventEnd!, dragState.initialEventStart!);
+        el.style.top = `${data.currentMinutes}px`;
+        el.style.left = `calc(64px + ${clampedDayIndex} * ((100% - 64px) / 7) + 4px)`;
+
+        const textEl = el.querySelector('.time-display');
+        if (textEl && dragState.startDay) {
+          // Use currentDay from ref (newDay) which might be different from startDay
+          const startBase = startOfDay(newDay);
+          const start = addMinutes(startBase, data.currentMinutes);
+          const end = addMinutes(start, duration);
+          textEl.textContent = `${format(start, "h:mm")} - ${format(end, "h:mm a")}`;
+        }
+
+      } else if (dragState.mode === 'resize') {
+        const start = dragState.startMinutes;
+        const end = data.currentMinutes;
+        const duration = end - start;
+        el.style.height = `${Math.max(15, duration)}px`;
+
+        const textEl = el.querySelector('.time-display');
+        if (textEl && dragState.startDay) {
+          const startBase = startOfDay(dragState.startDay);
+          textEl.textContent = `${format(addMinutes(startBase, start), "h:mm")} - ${format(addMinutes(startBase, end), "h:mm a")}`;
+        }
+      }
+    }
+  }, [dragState.isDragging, dragState.mode, dragState.activeEventId, dragState.dragOffsetMinutes, dragState.startMinutes, dragState.startDay, dragState.initialEventEnd, dragState.initialEventStart, dragState.startX, dragState.startY, weekDays]);
 
   // Handle mouse up
-  const handleMouseUp = React.useCallback(() => {
-    if (!dragState.isDragging || !dragState.startDay) return;
+  const handleMouseUp = React.useCallback(async () => {
+    // If we have no active interaction setup, return
+    if (!dragState.startDay) return;
 
-    const startMinutes = Math.min(dragState.startMinutes, dragState.currentMinutes);
-    const endMinutes = Math.max(dragState.startMinutes, dragState.currentMinutes);
-    const duration = endMinutes - startMinutes;
+    // Handle "click" case: mouse up but never dragged (threshold not met)
+    if (!dragState.isDragging) {
+      if ((dragState.mode === 'move' || dragState.mode === 'resize') && dragState.activeEventId) {
+        // Find the event and open details/modal
+        const event = events.find(e => e.id === dragState.activeEventId);
+        if (event) {
+          setEditingEvent(event);
+          setCreateModalInitialDate(new Date(event.startAt));
+          setCreateModalInitialEndDate(new Date(event.endAt));
+          setDialogOpen(true);
+        }
+      }
 
-    if (duration >= 15) {
-      const startDate = addMinutes(startOfDay(dragState.startDay), startMinutes);
-      const endDate = addMinutes(startOfDay(dragState.startDay), endMinutes);
-
-      setCreateModalInitialDate(startDate);
-      setCreateModalInitialEndDate(endDate);
-      setDialogOpen(true);
+      // Reset state and return
+      setDragState({
+        isDragging: false,
+        mode: 'create',
+        startDay: null,
+        startMinutes: 0,
+        currentDay: null,
+        currentMinutes: 0,
+        activeEventId: null,
+        initialEventStart: null,
+        initialEventEnd: null,
+        dragOffsetMinutes: 0,
+        startX: 0,
+        startY: 0,
+      });
+      return;
     }
+
+    // Capture final values from ref before resetting state
+    const finalData = dragDataRef.current;
+
+    // Optimistically reset drag state immediately to stop UI dragging
+    const currentMode = dragState.mode;
+    const currentActiveId = dragState.activeEventId;
+    const currentInitialStart = dragState.initialEventStart;
+    const currentInitialEnd = dragState.initialEventEnd;
+    const currentStartDay = dragState.startDay;
+    const currentStartMinutes = dragState.startMinutes;
 
     setDragState({
       isDragging: false,
+      mode: 'create',
       startDay: null,
       startMinutes: 0,
       currentDay: null,
       currentMinutes: 0,
+      activeEventId: null,
+      initialEventStart: null,
+      initialEventEnd: null,
+      dragOffsetMinutes: 0,
+      startX: 0,
+      startY: 0,
     });
-  }, [dragState]);
+
+    if (currentMode === 'create') {
+      const startMinutes = Math.min(currentStartMinutes, finalData.currentMinutes);
+      const endMinutes = Math.max(currentStartMinutes, finalData.currentMinutes);
+      const duration = endMinutes - startMinutes;
+
+      if (duration >= 15 && currentStartDay) {
+        const startDate = addMinutes(startOfDay(currentStartDay), startMinutes);
+        const endDate = addMinutes(startOfDay(currentStartDay), endMinutes);
+
+        setCreateModalInitialDate(startDate);
+        setCreateModalInitialEndDate(endDate);
+        setDialogOpen(true);
+      }
+    } else if (currentMode === 'move' && currentActiveId && currentInitialEnd && currentInitialStart) {
+      const originalDuration = differenceInMinutes(currentInitialEnd, currentInitialStart);
+
+      // Calculate new start time
+      // Use currentDay from REF
+      const finalDay = finalData.currentDay || currentStartDay;
+      if (finalDay) {
+        const newStartBase = startOfDay(finalDay);
+        const newStart = addMinutes(newStartBase, finalData.currentMinutes);
+        const newEnd = addMinutes(newStart, originalDuration);
+
+        const event = events.find(e => e.id === currentActiveId);
+        if (event) {
+          // Optimistic UI Update - instant visual feedback
+          setEvents(prev => prev.map(e => e.id === event.id ? {
+            ...e,
+            startAt: newStart.toISOString(),
+            endAt: newEnd.toISOString()
+          } : e));
+
+          // Sync with server in background (fire-and-forget, no state update on response)
+          fetch("/api/events", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id: event.id,
+              title: event.title,
+              description: event.description || null,
+              startAt: newStart.toISOString(),
+              endAt: newEnd.toISOString(),
+              color: event.color || "#EA2831",
+              categoryId: event.categoryId,
+              isPomodoro: event.isPomodoro,
+              inputDuration: event.inputDuration,
+              outputDuration: event.outputDuration,
+              isRecurring: event.isRecurring,
+              rrule: event.rrule,
+            }),
+          });
+        }
+      }
+    } else if (currentMode === 'resize' && currentActiveId && currentInitialStart) {
+      if (currentStartDay) {
+        const newEnd = addMinutes(startOfDay(currentStartDay), finalData.currentMinutes);
+
+        const event = events.find(e => e.id === currentActiveId);
+        if (event) {
+          // Optimistic UI Update - instant visual feedback
+          setEvents(prev => prev.map(e => e.id === event.id ? {
+            ...e,
+            endAt: newEnd.toISOString()
+          } : e));
+
+          // Sync with server in background (fire-and-forget, no state update on response)
+          fetch("/api/events", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              id: event.id,
+              title: event.title,
+              description: event.description || null,
+              startAt: currentInitialStart.toISOString(),
+              endAt: newEnd.toISOString(),
+              color: event.color || "#EA2831",
+              categoryId: event.categoryId,
+              isPomodoro: event.isPomodoro,
+              inputDuration: event.inputDuration,
+              outputDuration: event.outputDuration,
+              isRecurring: event.isRecurring,
+              rrule: event.rrule,
+            }),
+          });
+        }
+      }
+    }
+  }, [dragState, events]);
 
   // Add global mouse event listeners for drag
   React.useEffect(() => {
-    if (dragState.isDragging) {
+    if (dragState.startDay) { // Listen if we started an interaction (click/drag)
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
       return () => {
@@ -295,7 +654,7 @@ export function PomodoroCalendar() {
         window.removeEventListener("mouseup", handleMouseUp);
       };
     }
-  }, [dragState.isDragging, handleMouseMove, handleMouseUp]);
+  }, [dragState.startDay, handleMouseMove, handleMouseUp]);
 
   const openDialogForSlot = (date: Date, hour: number) => {
     const start = setMinutes(setHours(date, hour), 0);
@@ -440,9 +799,13 @@ export function PomodoroCalendar() {
     const widthPercent = 100 / totalColumns;
     const leftPercent = column * widthPercent;
 
+    // Use actual duration in pixels (1 minute = 1px)
+    // Minimum height of 15px for very short events to ensure visibility
+    const heightPx = Math.max(durationMinutes, 15);
+
     return {
       top: `${minutesInHour}px`,
-      height: `${Math.max(durationMinutes, 30)}px`,
+      height: `${heightPx}px`,
       width: `calc(${widthPercent}% - 8px)`,
       left: `calc(${leftPercent}% + 4px)`,
     };
@@ -450,10 +813,10 @@ export function PomodoroCalendar() {
 
   // Current time indicator position
   const getCurrentTimePosition = () => {
-    const now = new Date();
     const dayStart = startOfDay(now);
     const minutes = differenceInMinutes(now, dayStart);
-    return minutes;
+    // 1 minute = (SLOT_HEIGHT / 60) pixels. Since SLOT_HEIGHT = 60, it's 1px/min.
+    return minutes * (SLOT_HEIGHT / 60);
   };
 
   const currentTimePosition = getCurrentTimePosition();
@@ -545,18 +908,61 @@ export function PomodoroCalendar() {
   const getDragPreviewStyle = () => {
     if (!dragState.isDragging || !dragState.startDay) return null;
 
-    const startMinutes = Math.min(dragState.startMinutes, dragState.currentMinutes);
-    const endMinutes = Math.max(dragState.startMinutes, dragState.currentMinutes);
-    const duration = endMinutes - startMinutes;
+    // Default create mode logic
+    if (dragState.mode === 'create') {
+      const startMinutes = Math.min(dragState.startMinutes, dragState.currentMinutes);
+      const endMinutes = Math.max(dragState.startMinutes, dragState.currentMinutes);
+      const duration = endMinutes - startMinutes;
 
-    const dayIndex = weekDays.findIndex((d) => isSameDay(d, dragState.startDay!));
-    if (dayIndex === -1) return null;
+      const dayIndex = weekDays.findIndex((d) => isSameDay(d, dragState.startDay!));
+      if (dayIndex === -1) return null;
 
-    return {
-      top: `${startMinutes}px`,
-      height: `${duration}px`,
-      dayIndex,
-    };
+      return {
+        top: `${startMinutes}px`,
+        height: `${duration}px`,
+        left: `calc(64px + ${dayIndex} * ((100% - 64px) / 7) + 4px)`,
+        width: `calc((100% - 64px) / 7 - 8px)`,
+        type: 'create',
+      };
+    }
+
+    // Move and Resize modes
+    if ((dragState.mode === 'move' || dragState.mode === 'resize') && dragState.initialEventStart && dragState.initialEventEnd && dragState.activeEventId) {
+      const event = events.find(e => e.id === dragState.activeEventId);
+      if (!event) return null;
+
+      let startMinutes = 0;
+      let duration = 0;
+      let dayIndex = 0;
+
+      if (dragState.mode === 'move') {
+        // Use currentDay and currentMinutes
+        startMinutes = dragState.currentMinutes;
+        duration = differenceInMinutes(dragState.initialEventEnd, dragState.initialEventStart);
+
+        const currentDay = dragState.currentDay || dragState.startDay;
+        dayIndex = weekDays.findIndex((d) => isSameDay(d, currentDay!));
+      } else { // resize
+        startMinutes = dragState.startMinutes; // Start time is fixed
+        const endMinutes = dragState.currentMinutes;
+        duration = endMinutes - startMinutes;
+
+        dayIndex = weekDays.findIndex((d) => isSameDay(d, dragState.startDay!));
+      }
+
+      if (dayIndex === -1) return null;
+
+      return {
+        top: `${startMinutes}px`,
+        height: `${Math.max(15, duration)}px`,
+        left: `calc(64px + ${dayIndex} * ((100% - 64px) / 7) + 4px)`,
+        width: `calc((100% - 64px) / 7 - 8px)`, // Full width column for now (simplified)
+        type: dragState.mode,
+        event: event,
+      };
+    }
+
+    return null;
   };
 
   const dragPreview = getDragPreviewStyle();
@@ -759,15 +1165,18 @@ export function PomodoroCalendar() {
             {weekDays.some((day) => isToday(day)) && (
               <div
                 className="absolute left-0 right-0 z-20 flex items-center pointer-events-none"
-                style={{ top: `${currentTimePosition}px` }}
+                style={{
+                  top: `${currentTimePosition}px`,
+                  transform: 'translateY(-50%)'
+                }}
               >
                 <div className="w-16 flex justify-end pr-2">
-                  <span className="bg-primary text-primary-foreground text-[10px] px-1 rounded-sm">
-                    {format(new Date(), "h:mm")}
+                  <span className="bg-primary text-primary-foreground text-[10px] px-1.5 py-0.5 rounded-sm font-bold shadow-sm">
+                    {format(now, "h:mm")}
                   </span>
                 </div>
-                <div className="flex-1 h-[1.5px] bg-primary relative">
-                  <div className="absolute -left-1.5 -top-1.5 w-3 h-3 rounded-full bg-primary border-2 border-card"></div>
+                <div className="flex-1 h-[2px] bg-primary relative">
+                  <div className="absolute -left-1 -top-[4px] w-2.5 h-2.5 rounded-full bg-primary border-2 border-card shadow-sm"></div>
                 </div>
               </div>
             )}
@@ -783,21 +1192,61 @@ export function PomodoroCalendar() {
 
               {/* Drag Preview */}
               {dragPreview && (
-                <div
-                  className="absolute bg-primary/30 border-2 border-primary border-dashed rounded-lg z-30 pointer-events-none"
-                  style={{
-                    top: dragPreview.top,
-                    height: dragPreview.height,
-                    left: `calc(64px + ${dragPreview.dayIndex} * ((100% - 64px) / 7) + 4px)`,
-                    width: `calc((100% - 64px) / 7 - 8px)`,
-                  }}
-                >
-                  <div className="p-2 text-xs font-medium text-primary">
-                    {format(addMinutes(startOfDay(dragState.startDay!), Math.min(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
-                    {" - "}
-                    {format(addMinutes(startOfDay(dragState.startDay!), Math.max(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
+                dragPreview.type === 'create' ? (
+                  <div
+                    ref={dragPreviewRef}
+                    className="absolute bg-primary/30 border-2 border-primary border-dashed rounded-lg z-30 pointer-events-none"
+                    style={{
+                      top: dragPreview.top,
+                      height: dragPreview.height,
+                      left: dragPreview.left,
+                      width: dragPreview.width,
+                    }}
+                  >
+                    <div className="p-2 text-xs font-medium text-primary time-display">
+                      {format(addMinutes(startOfDay(dragState.startDay!), Math.min(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
+                      {" - "}
+                      {format(addMinutes(startOfDay(dragState.startDay!), Math.max(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  dragPreview.event && (
+                    <div
+                      ref={dragPreviewRef}
+                      className={`absolute p-2 rounded-lg text-xs font-medium shadow-lg z-30 overflow-hidden pointer-events-none opacity-80 ${dragPreview.event.isPomodoro
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-primary/10 text-primary border-l-4 border-primary"
+                        }`}
+                      style={{
+                        top: dragPreview.top,
+                        height: dragPreview.height,
+                        left: dragPreview.left,
+                        width: dragPreview.width,
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-0.5">
+                        <span className="truncate">{dragPreview.event.title}</span>
+                        {dragPreview.event.isPomodoro && (
+                          <span className="material-symbols-outlined text-[14px]">timer</span>
+                        )}
+                      </div>
+                      <span className={`text-[10px] time-display ${dragPreview.event.isPomodoro ? "opacity-80" : ""}`}>
+                        {/* Calculate time based on current position */}
+                        {dragState.mode === 'move' ? (
+                          <>
+                            {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes), "h:mm")} -{" "}
+                            {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes + differenceInMinutes(new Date(dragPreview.event.endAt), new Date(dragPreview.event.startAt))), "h:mm a")}
+                          </>
+                        ) : (
+                          <>
+                            {format(new Date(dragPreview.event.startAt), "h:mm")} -{" "}
+                            {format(addMinutes(startOfDay(dragState.startDay!), dragState.currentMinutes), "h:mm a")}
+                          </>
+                        )}
+                      </span>
+                    </div>
+                  )
+                )
               )}
 
               {/* Time rows */}
@@ -826,27 +1275,35 @@ export function PomodoroCalendar() {
                           return (
                             <div
                               key={event.id}
-                              className={`absolute p-2 rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden cursor-pointer hover:opacity-90 transition-opacity ${isPomodoroEvent
+                              className={`absolute rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden hover:opacity-90 transition-opacity ${isPomodoroEvent
                                 ? "bg-primary text-primary-foreground"
                                 : "bg-primary/10 text-primary border-l-4 border-primary"
-                                }`}
+                                } ${dragState.activeEventId === event.id ? "opacity-50 pointer-events-none" : "cursor-pointer"}`}
                               style={style}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handleEventClick(event, e);
                               }}
-                              onMouseDown={(e) => e.stopPropagation()}
+                              onMouseDown={(e) => handleEventMouseDown(e, event, day)}
                             >
-                              <div className="flex items-center justify-between mb-0.5">
-                                <span className="truncate">{event.title}</span>
-                                {isPomodoroEvent && (
-                                  <span className="material-symbols-outlined text-[14px]" title="Click to start timer">timer</span>
-                                )}
+                              <div className="p-2 h-full flex flex-col">
+                                <div className="flex items-center justify-between mb-0.5 pointer-events-none">
+                                  <span className="truncate">{event.title}</span>
+                                  {isPomodoroEvent && (
+                                    <span className="material-symbols-outlined text-[14px]" title="Click to start timer">timer</span>
+                                  )}
+                                </div>
+                                <span className={`text-[10px] pointer-events-none ${isPomodoroEvent ? "opacity-80" : ""}`}>
+                                  {format(new Date(event.startAt), "h:mm")} -{" "}
+                                  {format(new Date(event.endAt), "h:mm a")}
+                                </span>
                               </div>
-                              <span className={`text-[10px] ${isPomodoroEvent ? "opacity-80" : ""}`}>
-                                {format(new Date(event.startAt), "h:mm")} -{" "}
-                                {format(new Date(event.endAt), "h:mm a")}
-                              </span>
+
+                              {/* Resize Handle */}
+                              <div
+                                className="absolute bottom-0 left-0 right-0 h-3 cursor-s-resize hover:bg-black/10 z-20"
+                                onMouseDown={(e) => handleResizeMouseDown(e, event, day)}
+                              />
                             </div>
                           );
                         })}

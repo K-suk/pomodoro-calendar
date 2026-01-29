@@ -11,9 +11,22 @@ export type PomodoroState = {
   outputDuration: number; // minutes
 };
 
+// Storage key for persisting timer state
+const TIMER_STORAGE_KEY = 'pomodoro_timer_state';
+const ACTIVE_POMODORO_KEY = 'pomodoro_active_event_id';
+
+type StoredTimerState = {
+  phase: PomodoroPhase;
+  startTime: number; // timestamp when timer started
+  totalSeconds: number;
+  inputDuration: number;
+  outputDuration: number;
+  eventId?: string; // to identify which event this timer is for
+};
+
 export type UsePomodoroTimerReturn = {
   state: PomodoroState;
-  start: () => void;
+  start: (customInputDuration?: number, customOutputDuration?: number) => void;
   pause: () => void;
   resume: () => void;
   reset: () => void;
@@ -23,23 +36,126 @@ export type UsePomodoroTimerReturn = {
 export function usePomodoroTimer(
   inputDuration: number = 25,
   outputDuration: number = 5,
-  onPhaseChange?: (phase: PomodoroPhase) => void
+  onPhaseChange?: (phase: PomodoroPhase) => void,
+  eventId?: string // Optional event ID for persistence
 ): UsePomodoroTimerReturn {
-  const [state, setState] = useState<PomodoroState>({
-    phase: 'idle',
-    remainingSeconds: inputDuration * 60,
-    totalSeconds: inputDuration * 60,
-    isRunning: false,
-    inputDuration,
-    outputDuration,
+  // Resolve eventId: use passed value, or fallback to globally stored active event ID
+  const resolvedEventId = eventId ?? (typeof window !== 'undefined' ? localStorage.getItem(ACTIVE_POMODORO_KEY) ?? undefined : undefined);
+
+  // Synchronously load persisted state on initialization
+  const [storedState, setStoredState] = useState<StoredTimerState | null>(() => {
+    if (!resolvedEventId || typeof window === 'undefined') return null;
+    try {
+      const stored = localStorage.getItem(`${TIMER_STORAGE_KEY}_${resolvedEventId}`);
+      if (stored) {
+        const parsed = JSON.parse(stored) as StoredTimerState;
+        const now = Date.now();
+        const elapsed = Math.floor((now - parsed.startTime) / 1000);
+        
+        if (elapsed < parsed.totalSeconds) {
+          return parsed;
+        } else {
+          // Timer expired, clear storage
+          localStorage.removeItem(`${TIMER_STORAGE_KEY}_${resolvedEventId}`);
+          localStorage.removeItem(ACTIVE_POMODORO_KEY);
+          return null;
+        }
+      }
+    } catch (error) {
+      console.error('Failed to load timer state:', error);
+    }
+    return null;
   });
 
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startTimeRef = useRef<number | null>(storedState ? storedState.startTime : null);
+  const phaseStartTimeRef = useRef<number | null>(storedState ? storedState.startTime : null);
   const onPhaseChangeRef = useRef(onPhaseChange);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     onPhaseChangeRef.current = onPhaseChange;
   }, [onPhaseChange]);
+
+  // Calculate remaining seconds based on start time
+  const calculateRemaining = useCallback((stored: StoredTimerState | null): number => {
+    if (!stored || !phaseStartTimeRef.current) {
+      return inputDuration * 60;
+    }
+    
+    const now = Date.now();
+    const elapsed = Math.floor((now - phaseStartTimeRef.current) / 1000);
+    const remaining = stored.totalSeconds - elapsed;
+    
+    return Math.max(0, remaining);
+  }, [inputDuration]);
+
+  // Initialize state from stored state or defaults
+  const getInitialState = useCallback((): PomodoroState => {
+    if (storedState) {
+      const remaining = calculateRemaining(storedState);
+      return {
+        phase: storedState.phase,
+        remainingSeconds: remaining,
+        totalSeconds: storedState.totalSeconds,
+        isRunning: remaining > 0,
+        inputDuration: storedState.inputDuration,
+        outputDuration: storedState.outputDuration,
+      };
+    }
+    
+    return {
+      phase: 'idle',
+      remainingSeconds: inputDuration * 60,
+      totalSeconds: inputDuration * 60,
+      isRunning: false,
+      inputDuration,
+      outputDuration,
+    };
+  }, [storedState, inputDuration, outputDuration, calculateRemaining]);
+
+  const [state, setState] = useState<PomodoroState>(getInitialState);
+
+  // Update state when stored state changes
+  useEffect(() => {
+    if (storedState) {
+      const newState = getInitialState();
+      setState(newState);
+    }
+  }, [storedState, getInitialState]);
+
+  // Save state to localStorage
+  const saveState = useCallback((phase: PomodoroPhase, totalSeconds: number, startTime: number) => {
+    const targetEventId = eventId ?? resolvedEventId;
+    if (targetEventId && typeof window !== 'undefined') {
+      const stateToSave: StoredTimerState = {
+        phase,
+        startTime,
+        totalSeconds,
+        inputDuration,
+        outputDuration,
+        eventId: targetEventId,
+      };
+      try {
+        localStorage.setItem(`${TIMER_STORAGE_KEY}_${targetEventId}`, JSON.stringify(stateToSave));
+        localStorage.setItem(ACTIVE_POMODORO_KEY, targetEventId); // Store globally
+        setStoredState(stateToSave);
+      } catch (error) {
+        console.error('Failed to save timer state:', error);
+      }
+    }
+  }, [eventId, resolvedEventId, inputDuration, outputDuration]);
+
+  // Clear saved state
+  const clearSavedState = useCallback(() => {
+    const targetEventId = eventId ?? resolvedEventId;
+    if (targetEventId && typeof window !== 'undefined') {
+      localStorage.removeItem(`${TIMER_STORAGE_KEY}_${targetEventId}`);
+      localStorage.removeItem(ACTIVE_POMODORO_KEY); // Clear global key
+      setStoredState(null);
+      startTimeRef.current = null;
+      phaseStartTimeRef.current = null;
+    }
+  }, [eventId, resolvedEventId]);
 
   const clearTimer = useCallback(() => {
     if (intervalRef.current) {
@@ -48,72 +164,126 @@ export function usePomodoroTimer(
     }
   }, []);
 
-  const tick = useCallback(() => {
-    setState((prev) => {
-      if (!prev.isRunning || prev.phase === 'idle' || prev.phase === 'completed') {
-        return prev;
+  // Update timer based on elapsed time from start
+  const updateTimer = useCallback(() => {
+    if (!storedState || !phaseStartTimeRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    const elapsed = Math.floor((now - phaseStartTimeRef.current) / 1000);
+    const remaining = storedState.totalSeconds - elapsed;
+
+    if (remaining <= 0) {
+      // Phase transition
+      if (storedState.phase === 'input') {
+        const outputSeconds = storedState.outputDuration * 60;
+        const newStartTime = now;
+        phaseStartTimeRef.current = newStartTime;
+        saveState('output', outputSeconds, startTimeRef.current || newStartTime);
+        onPhaseChangeRef.current?.('output');
+        setState((prev) => ({
+          ...prev,
+          phase: 'output',
+          remainingSeconds: outputSeconds,
+          totalSeconds: outputSeconds,
+          isRunning: true,
+        }));
+      } else if (storedState.phase === 'output') {
+        clearTimer();
+        clearSavedState();
+        onPhaseChangeRef.current?.('completed');
+        setState((prev) => ({
+          ...prev,
+          phase: 'completed',
+          remainingSeconds: 0,
+          isRunning: false,
+        }));
       }
-
-      const newRemaining = prev.remainingSeconds - 1;
-
-      if (newRemaining <= 0) {
-        // Phase transition
-        if (prev.phase === 'input') {
-          const outputSeconds = prev.outputDuration * 60;
-          onPhaseChangeRef.current?.('output');
-          return {
-            ...prev,
-            phase: 'output',
-            remainingSeconds: outputSeconds,
-            totalSeconds: outputSeconds,
-          };
-        } else if (prev.phase === 'output') {
-          clearTimer();
-          onPhaseChangeRef.current?.('completed');
-          return {
-            ...prev,
-            phase: 'completed',
-            remainingSeconds: 0,
-            isRunning: false,
-          };
-        }
-      }
-
-      return {
+    } else {
+      setState((prev) => ({
         ...prev,
-        remainingSeconds: newRemaining,
-      };
-    });
-  }, [clearTimer]);
+        remainingSeconds: remaining,
+        isRunning: true,
+      }));
+    }
+  }, [storedState, saveState, clearTimer, clearSavedState]);
 
-  const start = useCallback(() => {
-    clearTimer();
-    const inputSeconds = inputDuration * 60;
+  const tick = useCallback(() => {
+    updateTimer();
+  }, [updateTimer]);
+
+  // Use a ref to always have the latest tick function in the interval
+  const tickRef = useRef(tick);
+  useEffect(() => {
+    tickRef.current = tick;
+  }, [tick]);
+
+  // Centralized interval management
+  useEffect(() => {
+    if (!state.isRunning) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      return;
+    }
+
+    // Always ensure a fresh interval if we should be running
+    if (!intervalRef.current) {
+      intervalRef.current = setInterval(() => {
+        tickRef.current();
+      }, 1000);
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [state.isRunning]);
+
+  const start = useCallback((customInputDuration?: number, customOutputDuration?: number) => {
+    const actualInputDuration = customInputDuration ?? inputDuration;
+    const actualOutputDuration = customOutputDuration ?? outputDuration;
+    const inputSeconds = actualInputDuration * 60;
+    const now = Date.now();
+    startTimeRef.current = now;
+    phaseStartTimeRef.current = now;
+    
+    saveState('input', inputSeconds, now);
+    
     setState({
       phase: 'input',
       remainingSeconds: inputSeconds,
       totalSeconds: inputSeconds,
       isRunning: true,
-      inputDuration,
-      outputDuration,
+      inputDuration: actualInputDuration,
+      outputDuration: actualOutputDuration,
     });
     onPhaseChangeRef.current?.('input');
-    intervalRef.current = setInterval(tick, 1000);
-  }, [inputDuration, outputDuration, tick, clearTimer]);
+  }, [inputDuration, outputDuration, saveState]);
 
   const pause = useCallback(() => {
-    clearTimer();
     setState((prev) => ({ ...prev, isRunning: false }));
-  }, [clearTimer]);
+    // Note: interval will be cleared by the useEffect monitoring state.isRunning
+  }, []);
 
   const resume = useCallback(() => {
-    if (state.phase === 'idle' || state.phase === 'completed') return;
+    if (!storedState || storedState.phase === 'idle' || storedState.phase === 'completed') return;
+    
+    // Adjust phase start time to account for pause duration
+    const now = Date.now();
+    const elapsedFromPhaseStart = Math.floor((now - (phaseStartTimeRef.current || now)) / 1000);
+    const alreadyElapsed = storedState.totalSeconds - (storedState.totalSeconds - elapsedFromPhaseStart);
+    phaseStartTimeRef.current = now - alreadyElapsed * 1000;
+    
     setState((prev) => ({ ...prev, isRunning: true }));
-    intervalRef.current = setInterval(tick, 1000);
-  }, [state.phase, tick]);
+  }, [storedState]);
 
   const reset = useCallback(() => {
-    clearTimer();
+    clearSavedState();
     setState({
       phase: 'idle',
       remainingSeconds: inputDuration * 60,
@@ -122,12 +292,17 @@ export function usePomodoroTimer(
       inputDuration,
       outputDuration,
     });
-  }, [inputDuration, outputDuration, clearTimer]);
+  }, [inputDuration, outputDuration, clearSavedState]);
 
   const skipToOutput = useCallback(() => {
-    if (state.phase !== 'input') return;
-    clearTimer();
+    if (!storedState || storedState.phase !== 'input') return;
+    
     const outputSeconds = outputDuration * 60;
+    const now = Date.now();
+    phaseStartTimeRef.current = now;
+    
+    saveState('output', outputSeconds, startTimeRef.current || now);
+    
     setState((prev) => ({
       ...prev,
       phase: 'output',
@@ -136,13 +311,56 @@ export function usePomodoroTimer(
       isRunning: true,
     }));
     onPhaseChangeRef.current?.('output');
-    intervalRef.current = setInterval(tick, 1000);
-  }, [state.phase, outputDuration, tick, clearTimer]);
+  }, [storedState, outputDuration, saveState]);
+
+  // Handle page visibility changes (tab switching)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && storedState && storedState.phase !== 'idle' && storedState.phase !== 'completed') {
+        // Recalculate time when tab becomes visible
+        updateTimer();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [storedState, updateTimer]);
+
+  // Auto-resume timer if stored state exists
+  useEffect(() => {
+    if (storedState && storedState.phase !== 'idle' && storedState.phase !== 'completed') {
+      const remaining = calculateRemaining(storedState);
+      if (remaining > 0) {
+        // Restore phase start time
+        const now = Date.now();
+        phaseStartTimeRef.current = now - (storedState.totalSeconds - remaining) * 1000;
+        
+        setState((prev) => ({
+          ...prev,
+          phase: storedState.phase,
+          remainingSeconds: remaining,
+          totalSeconds: storedState.totalSeconds,
+          isRunning: true,
+          inputDuration: storedState.inputDuration,
+          outputDuration: storedState.outputDuration,
+        }));
+      } else {
+        // Timer expired, transition phase or complete
+        updateTimer();
+      }
+    }
+  }, [storedState, calculateRemaining, updateTimer]);
 
   // Cleanup on unmount
   useEffect(() => {
-    return () => clearTimer();
-  }, [clearTimer]);
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, []);
 
   return {
     state,

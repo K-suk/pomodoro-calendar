@@ -27,7 +27,7 @@ function isWithinEventTime(startAt: string, endAt: string): boolean {
 
 export function PomodoroTimerModal({
   isOpen,
-  onClose: _onClose, // Intentionally unused - modal can be closed but timer continues
+  onClose,
   eventTitle,
   inputDuration,
   outputDuration,
@@ -36,7 +36,6 @@ export function PomodoroTimerModal({
   eventEndAt,
   timerState,
 }: PomodoroTimerModalProps) {
-  void _onClose; // Suppress unused variable warning
   const [completedSessions] = React.useState(0);
 
   // Use external timer state if provided, otherwise use defaults
@@ -53,13 +52,13 @@ export function PomodoroTimerModal({
   const minutes = Math.floor(state.remainingSeconds / 60);
   const seconds = state.remainingSeconds % 60;
 
-  const phaseLabel = state.phase === "input" 
-    ? "Focus Session" 
-    : state.phase === "output" 
-    ? "Blurting Time" 
-    : state.phase === "completed"
-    ? "Session Complete"
-    : "Ready";
+  const phaseLabel = state.phase === "input"
+    ? "Focus Session"
+    : state.phase === "output"
+      ? "Blurting Time"
+      : state.phase === "completed"
+        ? "Session Complete"
+        : "Ready";
 
   // Check if we're within the event time
   const withinEventTime = isWithinEventTime(eventStartAt, eventEndAt);
@@ -68,18 +67,36 @@ export function PomodoroTimerModal({
 
   // Note: Blurting modal is now handled by parent component
 
+  // During break phase, allow closing
+  const canClose = state.phase === "output";
+
   return (
     <div className="fixed inset-0 z-50">
-      {/* Overlay - no click to close */}
-      <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" />
-      
+      {/* Overlay - click to close only during break */}
+      <div
+        className="fixed inset-0 bg-black/40 backdrop-blur-sm"
+        onClick={canClose ? onClose : undefined}
+        style={{ cursor: canClose ? 'pointer' : 'default' }}
+      />
+
       {/* Modal */}
       <div className="fixed inset-0 flex items-center justify-center pointer-events-none">
         <div className="bg-card w-[420px] rounded-2xl shadow-2xl overflow-hidden flex flex-col items-center relative border border-border pointer-events-auto">
+          {/* Close button - only during break */}
+          {canClose && (
+            <button
+              onClick={onClose}
+              className="absolute top-4 right-4 p-2 rounded-full hover:bg-muted transition-colors z-10"
+              title="Continue in background"
+            >
+              <span className="material-symbols-outlined text-muted-foreground">close</span>
+            </button>
+          )}
+
           {/* Progress Bar */}
           <div className="absolute top-0 left-0 w-full h-1 bg-muted">
-            <div 
-              className="h-full bg-primary transition-all duration-1000 ease-linear" 
+            <div
+              className="h-full bg-primary transition-all duration-1000 ease-linear"
               style={{ width: `${progress}%` }}
             />
           </div>
@@ -123,9 +140,8 @@ export function PomodoroTimerModal({
               {Array.from({ length: totalSessions }).map((_, i) => (
                 <div
                   key={i}
-                  className={`size-2 rounded-full transition-colors ${
-                    i < completedSessions ? "bg-primary" : "bg-muted"
-                  }`}
+                  className={`size-2 rounded-full transition-colors ${i < completedSessions ? "bg-primary" : "bg-muted"
+                    }`}
                 />
               ))}
             </div>
@@ -137,11 +153,17 @@ export function PomodoroTimerModal({
               </p>
             </div>
 
-            {/* No escape message */}
+            {/* Message - different for focus vs break */}
             <div className="mt-6 text-center">
-              <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
-                Stay focused • No escape
-              </p>
+              {state.phase === "output" ? (
+                <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
+                  Break time • Click outside to minimize
+                </p>
+              ) : (
+                <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
+                  Stay focused • No escape
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -151,13 +173,13 @@ export function PomodoroTimerModal({
 }
 
 // Export for use in header persistent timer
-export function MiniTimer({ 
-  remainingSeconds, 
-  phase, 
+export function MiniTimer({
+  remainingSeconds,
+  phase,
   eventTitle,
-  onClick 
-}: { 
-  remainingSeconds: number; 
+  onClick
+}: {
+  remainingSeconds: number;
   phase: PomodoroPhase;
   eventTitle: string;
   onClick: () => void;
