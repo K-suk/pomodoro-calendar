@@ -31,6 +31,7 @@ import { EventCreateModal, type EventFormData } from "@/components/calendar/even
 import { usePomodoroTimer, type PomodoroPhase } from "@/hooks/use-pomodoro-timer";
 import { useBlurtingSession } from "@/hooks/use-blurting-session";
 import { BlurtingModal } from "@/components/pomodoro/blurting-modal";
+import { useNotifications } from "@/hooks/use-notifications";
 
 // Find the current active pomodoro event
 function findActivePomodoro(events: EventRecord[]): EventRecord | null {
@@ -41,6 +42,14 @@ function findActivePomodoro(events: EventRecord[]): EventRecord | null {
     const end = new Date(event.endAt).getTime();
     return now >= start && now <= end;
   }) || null;
+}
+
+// Check if a pomodoro event is completed (past its end time)
+function isCompletedPomodoro(event: EventRecord): boolean {
+  if (!event.isPomodoro) return false;
+  const now = new Date().getTime();
+  const end = new Date(event.endAt).getTime();
+  return now > end;
 }
 
 type EventRecord = {
@@ -100,7 +109,7 @@ export function PomodoroCalendar() {
   const [createModalInitialDate, setCreateModalInitialDate] = React.useState<Date | undefined>();
   const [createModalInitialEndDate, setCreateModalInitialEndDate] = React.useState<Date | undefined>();
   const [now, setNow] = React.useState(new Date());
-
+  const [completedPomodoroWarning, setCompletedPomodoroWarning] = React.useState(false);
 
   // Active pomodoro session state (persists even when modal is closed)
   const [activePomodoro, setActivePomodoro] = React.useState<EventRecord | null>(null);
@@ -109,13 +118,34 @@ export function PomodoroCalendar() {
   // Blurting session hook (must be declared before handlePhaseChange)
   const blurtingSession = useBlurtingSession();
 
+  // Notifications hook
+  const notifications = useNotifications();
+
   // Timer hook for persistent timer
   const handlePhaseChange = React.useCallback((phase: PomodoroPhase) => {
+    // Send notification for phase change
+    // - For completed: Always send (user needs to know session ended)
+    // - For other phases: Only when user is away from the page
+    console.log('[DEBUG] handlePhaseChange called:', {
+      phase,
+      documentHidden: document.hidden,
+      shouldNotify: phase !== "idle" && (phase === "completed" || document.hidden),
+      notificationPermission: notifications.permission,
+      eventTitle: activePomodoro?.title,
+    });
+
+    if (phase !== "idle" && (phase === "completed" || document.hidden)) {
+      console.log('[DEBUG] Sending notification for phase:', phase);
+      const result = notifications.notifyPhaseChange(phase, activePomodoro?.title);
+      console.log('[DEBUG] Notification result:', result);
+    }
+
     if (phase === "output") {
       blurtingSession.startSession();
       setShowBlurtingModal(true);
+      setTimerModalOpen(false);
     }
-  }, [blurtingSession]);
+  }, [blurtingSession, notifications, activePomodoro?.title]);
 
   const persistentTimer = usePomodoroTimer(
     activePomodoro?.inputDuration ?? 25,
@@ -152,6 +182,11 @@ export function PomodoroCalendar() {
   // Start timer when activePomodoro is set AND timer is not already running
   React.useEffect(() => {
     if (activePomodoro && persistentTimer.state.phase === "idle" && !persistentTimer.state.isRunning) {
+      // Request notification permission if not already granted
+      if (notifications.permission === "default") {
+        notifications.requestPermission();
+      }
+
       // DEBUG: Log the actual duration values
       console.log('Starting timer with:', {
         eventTitle: activePomodoro.title,
@@ -164,7 +199,21 @@ export function PomodoroCalendar() {
       persistentTimer.start(activePomodoro.inputDuration, activePomodoro.outputDuration);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePomodoro, persistentTimer.state.phase, persistentTimer.state.isRunning]);
+  }, [activePomodoro, persistentTimer.state.phase, persistentTimer.state.isRunning, notifications.permission]);
+
+  // Auto-complete session when blurting timer reaches 0 (phase becomes "completed")
+  React.useEffect(() => {
+    if (persistentTimer.state.phase === "completed" && activePomodoro && showBlurtingModal) {
+      // Timer ended - auto-complete the session
+      const blurtingText = blurtingSession.state.blurtingText;
+      blurtingSession.endSession();
+      setShowBlurtingModal(false);
+      handleTimerComplete(blurtingText);
+      setActivePomodoro(null);
+      persistentTimer.reset();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [persistentTimer.state.phase]);
 
   // Drag state
   interface DragState {
@@ -316,6 +365,13 @@ export function PomodoroCalendar() {
     e.stopPropagation();
     e.preventDefault();
 
+    // Block move for completed pomodoros
+    if (isCompletedPomodoro(event)) {
+      setCompletedPomodoroWarning(true);
+      setTimeout(() => setCompletedPomodoroWarning(false), 3000);
+      return;
+    }
+
     const start = new Date(event.startAt);
     const end = new Date(event.endAt);
 
@@ -371,6 +427,13 @@ export function PomodoroCalendar() {
     if (e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
+
+    // Block resize for completed pomodoros
+    if (isCompletedPomodoro(event)) {
+      setCompletedPomodoroWarning(true);
+      setTimeout(() => setCompletedPomodoroWarning(false), 3000);
+      return;
+    }
 
     const start = new Date(event.startAt);
     const end = new Date(event.endAt);
@@ -897,11 +960,29 @@ export function PomodoroCalendar() {
   const handleTimerComplete = async (blurtingText: string) => {
     if (!activePomodoro) return;
 
-    // TODO: Save blurting log to database
-    console.log("Blurting completed:", {
-      eventId: activePomodoro.id,
-      blurtingText,
-    });
+    try {
+      const response = await fetch("/api/pomodoro-logs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          eventId: activePomodoro.id,
+          blurtingText,
+          inputMinutes: activePomodoro.inputDuration,
+          outputMinutes: activePomodoro.outputDuration,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to save pomodoro log");
+      }
+
+      console.log("Blurting log saved successfully");
+    } catch (error) {
+      console.error("Error saving pomodoro log:", error);
+      // Ideally show a toast error here
+    }
   };
 
   // Calculate drag preview
@@ -1331,7 +1412,10 @@ export function PomodoroCalendar() {
         initialEndDate={createModalInitialEndDate}
         isSubmitting={isSubmitting}
         editingEvent={editingEvent}
-        isDeleteOnly={!!(editingEvent && activePomodoro && editingEvent.id === activePomodoro.id)}
+        isDeleteOnly={!!(editingEvent && (
+          (activePomodoro && editingEvent.id === activePomodoro.id) ||
+          isCompletedPomodoro(editingEvent)
+        ))}
       />
 
       {/* Mobile FAB */}
@@ -1362,6 +1446,8 @@ export function PomodoroCalendar() {
           eventStartAt={activePomodoro.startAt}
           eventEndAt={activePomodoro.endAt}
           timerState={persistentTimer.state}
+          onDebugSkip1Min={persistentTimer.debugSkip1Min}
+          onDebugSkip10Min={persistentTimer.debugSkip10Min}
         />
       )}
 
@@ -1374,18 +1460,28 @@ export function PomodoroCalendar() {
             blurtingSession.endSession();
             setShowBlurtingModal(false);
             handleTimerComplete(text);
-            // Check if session is done
-            if (persistentTimer.state.phase === "completed") {
-              setActivePomodoro(null);
-              persistentTimer.reset();
-            }
+            // Session is done - reset everything
+            setActivePomodoro(null);
+            persistentTimer.reset();
           }}
-          remainingSeconds={persistentTimer.state.remainingSeconds}
-          totalSeconds={persistentTimer.state.totalSeconds}
           eventTitle={activePomodoro.title}
           initialText={blurtingSession.state.blurtingText}
           canComplete={persistentTimer.state.remainingSeconds <= 0}
+          remainingSeconds={persistentTimer.state.remainingSeconds}
+          totalSeconds={persistentTimer.state.totalSeconds}
+          onTextChange={blurtingSession.updateText}
+          onDebugSkip1Min={persistentTimer.debugSkip1Min}
         />
+      )}
+
+      {/* Completed Pomodoro Warning Toast */}
+      {completedPomodoroWarning && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-4 fade-in duration-300">
+          <div className="flex items-center gap-3 bg-amber-500 text-white px-4 py-3 rounded-lg shadow-lg">
+            <span className="material-symbols-outlined">lock</span>
+            <span className="font-medium">Completed Pomodoros cannot be edited. Only deletion is allowed.</span>
+          </div>
+        </div>
       )}
     </div>
   );

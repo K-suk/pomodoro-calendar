@@ -31,6 +31,9 @@ export type UsePomodoroTimerReturn = {
   resume: () => void;
   reset: () => void;
   skipToOutput: () => void;
+  // Debug functions (remove later)
+  debugSkip1Min: () => void;
+  debugSkip10Min: () => void;
 };
 
 export function usePomodoroTimer(
@@ -124,15 +127,23 @@ export function usePomodoroTimer(
   }, [storedState, getInitialState]);
 
   // Save state to localStorage
-  const saveState = useCallback((phase: PomodoroPhase, totalSeconds: number, startTime: number) => {
+  const saveState = useCallback((
+    phase: PomodoroPhase, 
+    totalSeconds: number, 
+    startTime: number,
+    customInputDuration?: number,
+    customOutputDuration?: number
+  ) => {
     const targetEventId = eventId ?? resolvedEventId;
+    const actualInputDuration = customInputDuration ?? inputDuration;
+    const actualOutputDuration = customOutputDuration ?? outputDuration;
     if (targetEventId && typeof window !== 'undefined') {
       const stateToSave: StoredTimerState = {
         phase,
         startTime,
         totalSeconds,
-        inputDuration,
-        outputDuration,
+        inputDuration: actualInputDuration,
+        outputDuration: actualOutputDuration,
         eventId: targetEventId,
       };
       try {
@@ -177,18 +188,39 @@ export function usePomodoroTimer(
     if (remaining <= 0) {
       // Phase transition
       if (storedState.phase === 'input') {
-        const outputSeconds = storedState.outputDuration * 60;
-        const newStartTime = now;
-        phaseStartTimeRef.current = newStartTime;
-        saveState('output', outputSeconds, startTimeRef.current || newStartTime);
-        onPhaseChangeRef.current?.('output');
-        setState((prev) => ({
-          ...prev,
-          phase: 'output',
-          remainingSeconds: outputSeconds,
-          totalSeconds: outputSeconds,
-          isRunning: true,
-        }));
+        // Check if there's a blurting/output phase
+        if (storedState.outputDuration > 0) {
+          const outputSeconds = storedState.outputDuration * 60;
+          const newStartTime = now;
+          phaseStartTimeRef.current = newStartTime;
+          // IMPORTANT: Pass the stored durations to ensure we don't accidentally overwrite them with stale hook props
+          saveState(
+            'output', 
+            outputSeconds, 
+            startTimeRef.current || newStartTime, 
+            storedState.inputDuration, 
+            storedState.outputDuration
+          );
+          onPhaseChangeRef.current?.('output');
+          setState((prev) => ({
+            ...prev,
+            phase: 'output',
+            remainingSeconds: outputSeconds,
+            totalSeconds: outputSeconds,
+            isRunning: true, // Timer runs during blurting phase
+          }));
+        } else {
+          // No output phase (focus only mode), go directly to completed
+          clearTimer();
+          clearSavedState();
+          onPhaseChangeRef.current?.('completed');
+          setState((prev) => ({
+            ...prev,
+            phase: 'completed',
+            remainingSeconds: 0,
+            isRunning: false,
+          }));
+        }
       } else if (storedState.phase === 'output') {
         clearTimer();
         clearSavedState();
@@ -252,7 +284,8 @@ export function usePomodoroTimer(
     startTimeRef.current = now;
     phaseStartTimeRef.current = now;
     
-    saveState('input', inputSeconds, now);
+    // Pass the actual durations to saveState to ensure correct values are persisted
+    saveState('input', inputSeconds, now, actualInputDuration, actualOutputDuration);
     
     setState({
       phase: 'input',
@@ -362,6 +395,21 @@ export function usePomodoroTimer(
     };
   }, []);
 
+  // Debug functions to skip time (remove later)
+  const debugSkip1Min = useCallback(() => {
+    if (phaseStartTimeRef.current) {
+      phaseStartTimeRef.current -= 60 * 1000; // Skip 1 minute
+      updateTimer();
+    }
+  }, [updateTimer]);
+
+  const debugSkip10Min = useCallback(() => {
+    if (phaseStartTimeRef.current) {
+      phaseStartTimeRef.current -= 10 * 60 * 1000; // Skip 10 minutes
+      updateTimer();
+    }
+  }, [updateTimer]);
+
   return {
     state,
     start,
@@ -369,6 +417,8 @@ export function usePomodoroTimer(
     resume,
     reset,
     skipToOutput,
+    debugSkip1Min,
+    debugSkip10Min,
   };
 }
 

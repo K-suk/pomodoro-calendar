@@ -15,6 +15,9 @@ type PomodoroTimerModalProps = {
   eventEndAt: string; // ISO string
   // External timer state (managed by parent)
   timerState?: PomodoroState;
+  // Debug functions (remove later)
+  onDebugSkip1Min?: () => void;
+  onDebugSkip10Min?: () => void;
 };
 
 // Check if current time is within event time range
@@ -35,6 +38,8 @@ export function PomodoroTimerModal({
   eventStartAt,
   eventEndAt,
   timerState,
+  onDebugSkip1Min,
+  onDebugSkip10Min,
 }: PomodoroTimerModalProps) {
   const [completedSessions] = React.useState(0);
 
@@ -67,8 +72,8 @@ export function PomodoroTimerModal({
 
   // Note: Blurting modal is now handled by parent component
 
-  // During break phase, allow closing
-  const canClose = state.phase === "output";
+  // Allow closing at any phase - timer will continue in header
+  const canClose = true;
 
   return (
     <div className="fixed inset-0 z-50">
@@ -165,6 +170,28 @@ export function PomodoroTimerModal({
                 </p>
               )}
             </div>
+
+            {/* Debug buttons (remove later) */}
+            {(onDebugSkip1Min || onDebugSkip10Min) && (
+              <div className="mt-6 flex gap-2 justify-center">
+                {onDebugSkip1Min && (
+                  <button
+                    onClick={onDebugSkip1Min}
+                    className="px-3 py-1 text-xs bg-orange-500 text-white rounded hover:bg-orange-600"
+                  >
+                    +1分
+                  </button>
+                )}
+                {onDebugSkip10Min && (
+                  <button
+                    onClick={onDebugSkip10Min}
+                    className="px-3 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600"
+                  >
+                    +10分
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

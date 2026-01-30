@@ -12,6 +12,9 @@ type BlurtingModalProps = {
   eventTitle?: string;
   initialText?: string;
   canComplete?: boolean; // Only allow completion when true (timer finished)
+  onTextChange?: (text: string) => void; // Sync text changes to parent
+  // Debug function (remove later)
+  onDebugSkip1Min?: () => void;
 };
 
 export function BlurtingModal({
@@ -23,6 +26,8 @@ export function BlurtingModal({
   eventTitle,
   initialText = "",
   canComplete = true, // Default to true for backwards compatibility
+  onTextChange,
+  onDebugSkip1Min,
 }: BlurtingModalProps) {
   void _onClose; // Suppress unused variable warning
   const [text, setText] = React.useState(initialText);
@@ -68,7 +73,7 @@ export function BlurtingModal({
   // Auto-save simulation
   React.useEffect(() => {
     if (!text) return;
-    
+
     setIsSaving(true);
     const timer = setTimeout(() => {
       setIsSaving(false);
@@ -87,23 +92,25 @@ export function BlurtingModal({
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/85 backdrop-blur-sm">
         {/* Modal Content */}
         <div className="flex flex-col w-full max-w-[800px] bg-card rounded-xl shadow-2xl border border-border/50 overflow-hidden relative">
-          {/* Progress Bar */}
-          <div className="flex flex-col w-full">
-            <div className="h-1.5 w-full bg-muted">
-              <div 
-                className="h-full bg-primary transition-all duration-1000 ease-linear" 
-                style={{ width: `${progress}%` }}
-              />
+          {/* Progress Bar - Only show if timer is active */}
+          {totalSeconds > 0 && (
+            <div className="flex flex-col w-full">
+              <div className="h-1.5 w-full bg-muted">
+                <div
+                  className="h-full bg-primary transition-all duration-1000 ease-linear"
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+              <div className="flex justify-between items-center px-8 py-2 border-b border-border">
+                <span className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
+                  Recall Active
+                </span>
+                <span className="text-xs font-mono font-medium text-primary">
+                  {formatTime(remainingSeconds)} remaining
+                </span>
+              </div>
             </div>
-            <div className="flex justify-between items-center px-8 py-2 border-b border-border">
-              <span className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
-                Recall Active
-              </span>
-              <span className="text-xs font-mono font-medium text-primary">
-                {formatTime(remainingSeconds)} remaining
-              </span>
-            </div>
-          </div>
+          )}
 
           {/* Header */}
           <div className="px-8 pt-10 pb-4 text-center">
@@ -128,7 +135,10 @@ export function BlurtingModal({
                 className="flex w-full h-full min-h-[360px] min-w-0 flex-1 resize-none overflow-y-auto border-none focus:ring-0 focus:outline-none bg-transparent p-0 text-lg md:text-xl font-normal leading-relaxed placeholder:text-muted-foreground/40"
                 placeholder="Write down everything you remember..."
                 value={text}
-                onChange={(e) => setText(e.target.value)}
+                onChange={(e) => {
+                  setText(e.target.value);
+                  onTextChange?.(e.target.value);
+                }}
                 autoFocus
               />
             </label>
@@ -143,13 +153,21 @@ export function BlurtingModal({
               <span>{isSaving ? "Saving..." : "Saved"}</span>
             </div>
             <div className="flex items-center gap-4">
+              {/* Debug button (remove later) */}
+              {onDebugSkip1Min && (
+                <button
+                  onClick={onDebugSkip1Min}
+                  className="px-3 py-1 text-xs bg-orange-500 text-white rounded hover:bg-orange-600"
+                >
+                  +1分
+                </button>
+              )}
               {/* No cancel button - must complete the blurting session */}
-              <button 
-                className={`flex min-w-[100px] items-center justify-center overflow-hidden rounded-lg h-10 px-6 text-sm font-bold leading-normal tracking-wide transition-all ${
-                  canComplete 
-                    ? "cursor-pointer bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground" 
-                    : "cursor-not-allowed bg-muted text-muted-foreground"
-                }`}
+              <button
+                className={`flex min-w-[100px] items-center justify-center overflow-hidden rounded-lg h-10 px-6 text-sm font-bold leading-normal tracking-wide transition-all ${canComplete
+                  ? "cursor-pointer bg-primary/10 text-primary hover:bg-primary hover:text-primary-foreground"
+                  : "cursor-not-allowed bg-muted text-muted-foreground"
+                  }`}
                 onClick={handleComplete}
                 disabled={!canComplete}
               >
