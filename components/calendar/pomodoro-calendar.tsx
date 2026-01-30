@@ -124,20 +124,13 @@ export function PomodoroCalendar() {
   // Timer hook for persistent timer
   const handlePhaseChange = React.useCallback((phase: PomodoroPhase) => {
     // Send notification for phase change
-    // - For completed: Always send (user needs to know session ended)
-    // - For other phases: Only when user is away from the page
-    console.log('[DEBUG] handlePhaseChange called:', {
-      phase,
-      documentHidden: document.hidden,
-      shouldNotify: phase !== "idle" && (phase === "completed" || document.hidden),
-      notificationPermission: notifications.permission,
-      eventTitle: activePomodoro?.title,
-    });
+    // - For output/completed: Always send (user needs to know timer ended)
+    // - For input: Only when user is away from the page
+    const alwaysNotifyPhases = phase === "output" || phase === "completed";
+    const shouldNotify = phase !== "idle" && (alwaysNotifyPhases || document.hidden);
 
-    if (phase !== "idle" && (phase === "completed" || document.hidden)) {
-      console.log('[DEBUG] Sending notification for phase:', phase);
-      const result = notifications.notifyPhaseChange(phase, activePomodoro?.title);
-      console.log('[DEBUG] Notification result:', result);
+    if (shouldNotify) {
+      notifications.notifyPhaseChange(phase, activePomodoro?.title);
     }
 
     if (phase === "output") {
@@ -187,14 +180,6 @@ export function PomodoroCalendar() {
         notifications.requestPermission();
       }
 
-      // DEBUG: Log the actual duration values
-      console.log('Starting timer with:', {
-        eventTitle: activePomodoro.title,
-        inputDuration: activePomodoro.inputDuration,
-        outputDuration: activePomodoro.outputDuration,
-        eventStart: activePomodoro.startAt,
-        eventEnd: activePomodoro.endAt,
-      });
       // Pass explicit durations to avoid stale closure issues
       persistentTimer.start(activePomodoro.inputDuration, activePomodoro.outputDuration);
     }
@@ -209,6 +194,8 @@ export function PomodoroCalendar() {
       blurtingSession.endSession();
       setShowBlurtingModal(false);
       handleTimerComplete(blurtingText);
+      // Send completion notification
+      notifications.notifyPhaseChange("completed", activePomodoro.title);
       setActivePomodoro(null);
       persistentTimer.reset();
     }
@@ -977,8 +964,6 @@ export function PomodoroCalendar() {
       if (!response.ok) {
         throw new Error("Failed to save pomodoro log");
       }
-
-      console.log("Blurting log saved successfully");
     } catch (error) {
       console.error("Error saving pomodoro log:", error);
       // Ideally show a toast error here
@@ -1460,6 +1445,8 @@ export function PomodoroCalendar() {
             blurtingSession.endSession();
             setShowBlurtingModal(false);
             handleTimerComplete(text);
+            // Send completion notification
+            notifications.notifyPhaseChange("completed", activePomodoro.title);
             // Session is done - reset everything
             setActivePomodoro(null);
             persistentTimer.reset();
