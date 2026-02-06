@@ -1,39 +1,34 @@
 import { NextResponse } from "next/server";
 
 import { prisma } from "@/lib/prisma";
-import { createClient } from "@/utils/supabase/server";
-
-type EventPayload = {
-  title?: string;
-  description?: string | null;
-  startAt?: string;
-  endAt?: string;
-  color?: string | null;
-  categoryId?: string | null;
-  isPomodoro?: boolean;
-  inputDuration?: number;
-  outputDuration?: number;
-  isRecurring?: boolean;
-  rrule?: string | null;
-};
-
-async function getAuthenticatedUser() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  return user;
-}
+import { CreateEventSchema, UpdateEventSchema, EventQuerySchema } from "@/lib/validations";
+import { requireAuth } from "@/lib/auth";
+import { validateCsrfToken } from "@/lib/csrf";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 export async function GET(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
 
   const { searchParams } = new URL(request.url);
-  const start = searchParams.get("start");
-  const end = searchParams.get("end");
+  const startRaw = searchParams.get("start");
+  const endRaw = searchParams.get("end");
+
+  // Validate query params using Zod
+  const queryResult = EventQuerySchema.safeParse({
+    start: startRaw ?? undefined,
+    end: endRaw ?? undefined,
+  });
+
+  if (!queryResult.success) {
+    return NextResponse.json(
+      { error: "Invalid query parameters", details: queryResult.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const { start, end } = queryResult.data;
 
   const where: Record<string, unknown> = { userId: user.id };
   if (start && end) {
@@ -56,19 +51,40 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Rate Limiting (100 requests / minute)
+  if (!checkRateLimit(user.id)) {
+    return NextResponse.json(
+      { error: "Too many requests. Please try again later." },
+      { status: 429 }
+    );
+  }
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
   if (!user.email) {
     return NextResponse.json({ error: "User email required" }, { status: 400 });
   }
 
-  const body = (await request.json()) as EventPayload;
-  if (!body.title || !body.startAt || !body.endAt) {
-    return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+  const json = await request.json();
+  const result = CreateEventSchema.safeParse(json);
+
+  if (!result.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: result.error.flatten() },
+      { status: 400 }
+    );
   }
+
+  const body = result.data;
 
   await prisma.user.upsert({
     where: { id: user.id },
@@ -94,15 +110,15 @@ export async function POST(request: Request) {
       userId: user.id,
       title: body.title,
       description: body.description ?? null,
-      color: body.color ?? "#3b82f6",
+      color: body.color,
       categoryId: body.categoryId ?? null,
       startAt: new Date(body.startAt),
       endAt: new Date(body.endAt),
-      isPomodoro: Boolean(body.isPomodoro),
-      inputDuration: body.inputDuration ?? 20,
-      outputDuration: body.outputDuration ?? 5,
-      isRecurring: Boolean(body.isRecurring),
-      rrule: body.isRecurring ? body.rrule ?? null : null,
+      isPomodoro: body.isPomodoro,
+      inputDuration: body.inputDuration,
+      outputDuration: body.outputDuration,
+      isRecurring: body.isRecurring,
+      rrule: body.rrule ?? null,
     },
   });
 
@@ -110,15 +126,28 @@ export async function POST(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
-  const body = (await request.json()) as EventPayload & { id?: string };
-  if (!body.id) {
-    return NextResponse.json({ error: "Event ID is required" }, { status: 400 });
+  const json = await request.json();
+  const result = UpdateEventSchema.safeParse(json);
+
+  if (!result.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: result.error.flatten() },
+      { status: 400 }
+    );
   }
+
+  const body = result.data;
 
   // Verify the event belongs to the user
   const existingEvent = await prisma.event.findFirst({
@@ -132,17 +161,22 @@ export async function PUT(request: Request) {
   const event = await prisma.event.update({
     where: { id: body.id },
     data: {
-      title: body.title ?? existingEvent.title,
-      description: body.description !== undefined ? body.description : existingEvent.description,
-      color: body.color ?? existingEvent.color,
-      categoryId: body.categoryId !== undefined ? body.categoryId : existingEvent.categoryId,
-      startAt: body.startAt ? new Date(body.startAt) : existingEvent.startAt,
-      endAt: body.endAt ? new Date(body.endAt) : existingEvent.endAt,
-      isPomodoro: body.isPomodoro !== undefined ? Boolean(body.isPomodoro) : existingEvent.isPomodoro,
-      inputDuration: body.inputDuration ?? existingEvent.inputDuration,
-      outputDuration: body.outputDuration ?? existingEvent.outputDuration,
-      isRecurring: body.isRecurring !== undefined ? Boolean(body.isRecurring) : existingEvent.isRecurring,
-      rrule: body.isRecurring ? (body.rrule ?? existingEvent.rrule) : null,
+      title: body.title,
+      description: body.description ?? existingEvent.description, // Keep existing if undefined in partial update? careful with partial
+      // Ideally UpdateSchema shouldn't be partial if we want full replacement, but here we likely want standard update behavior. 
+      // Zod safeParse with partial returns undefined for missing keys.
+      // We should use `?? existingEvent.field` only if we intend to allow partial updates.
+      // Let's stick to the logic of "if provided in body, update it; otherwise keep existing".
+      // But safeParse removes unknown keys, so body only has valid keys.
+      color: body.color,
+      categoryId: body.categoryId,
+      startAt: body.startAt ? new Date(body.startAt) : undefined, // schema makes them optional in partial
+      endAt: body.endAt ? new Date(body.endAt) : undefined,
+      isPomodoro: body.isPomodoro,
+      inputDuration: body.inputDuration,
+      outputDuration: body.outputDuration,
+      isRecurring: body.isRecurring,
+      rrule: body.rrule, // Update rule if provided
     },
   });
 
@@ -150,9 +184,15 @@ export async function PUT(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
   const { searchParams } = new URL(request.url);

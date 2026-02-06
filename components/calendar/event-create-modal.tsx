@@ -6,6 +6,7 @@ import { RecurrencePicker, type RecurrenceConfig, generateRRule } from "./recurr
 import { CategoryPicker, type Category } from "./category-picker";
 import { CategoryCreateModal } from "./category-create-modal";
 import { CategoryEditModal } from "./category-edit-modal";
+import { useCsrf } from "@/hooks/use-csrf";
 
 type EventRecord = {
   id: string;
@@ -52,14 +53,19 @@ export type EventFormData = {
   rrule: string | null;
 };
 
-// Standard cycle: 25 min focus + 5 min blurting = 30 min
+// Standard cycle with blurting: 20 min focus + 5 min blurting + 5 min break = 30 min
+const WITH_BLURTING_FOCUS = 20;
+const WITH_BLURTING_OUTPUT = 5;
+
+// Standard cycle without blurting: 25 min focus + 5 min break = 30 min
+const WITHOUT_BLURTING_FOCUS = 25;
+const WITHOUT_BLURTING_OUTPUT = 0;
+
 const STANDARD_CYCLE_DURATION = 30;
-const STANDARD_FOCUS_DURATION = 25;
-const STANDARD_BLURTING_DURATION = 5;
 
 // Minimum durations for pomodoro
-const MIN_POMODORO_DURATION = 25; // Focus only, no break
-const MIN_POMODORO_WITH_BREAK_DURATION = 30; // Focus + blurting
+const MIN_POMODORO_DURATION = 25; // Focus only (or focus+break)
+const MIN_POMODORO_WITH_BREAK_DURATION = 30; // Min for full cycle
 
 // Calculate default pomodoro durations based on event length
 // Returns null if duration is too short for pomodoro
@@ -69,43 +75,40 @@ const calculateDefaultPomodoroSettings = (eventDurationMinutes: number) => {
     return null;
   }
 
-  // Exactly 25 minutes: Focus only mode (no blurting)
+  // Exactly 25 minutes: Without blurting (25-0)
   if (eventDurationMinutes >= MIN_POMODORO_DURATION && eventDurationMinutes < MIN_POMODORO_WITH_BREAK_DURATION) {
     return {
       inputDuration: 25,
-      outputDuration: 0, // No blurting for 25-29 min events
+      outputDuration: 0,
       longBreakDuration: 0,
       sets: 1,
       isStandardCycle: false,
-      isFocusOnlyMode: true,
     };
   }
 
-  // 30+ minutes: Standard cycle with blurting
+  // 30+ minutes: Default to "With Blurting" (20-5-5)
   // If divisible by 30, use perfect cycles
   if (eventDurationMinutes % STANDARD_CYCLE_DURATION === 0) {
     const cycles = eventDurationMinutes / STANDARD_CYCLE_DURATION;
     return {
-      inputDuration: STANDARD_FOCUS_DURATION,
-      outputDuration: STANDARD_BLURTING_DURATION,
+      inputDuration: WITH_BLURTING_FOCUS, // 20
+      outputDuration: WITH_BLURTING_OUTPUT, // 5
       longBreakDuration: 15,
       sets: cycles,
       isStandardCycle: true,
-      isFocusOnlyMode: false,
     };
   }
 
-  // For non-standard durations (35, 45, etc.), calculate proportionally
-  // Focus = eventDuration - 5 (leaving 5 min for blurting)
-  const inputDuration = eventDurationMinutes - STANDARD_BLURTING_DURATION;
-
+  // For non-standard durations, try to fit standard cycles or fallback
+  // Logic: Maximize focus time?
+  // Let's stick to default "With Blurting" ratio if possible?
+  // Or just default to With Blurting settings for safety
   return {
-    inputDuration,
-    outputDuration: STANDARD_BLURTING_DURATION,
+    inputDuration: WITH_BLURTING_FOCUS,
+    outputDuration: WITH_BLURTING_OUTPUT,
     longBreakDuration: 15,
     sets: 1,
     isStandardCycle: false,
-    isFocusOnlyMode: false,
   };
 };
 
@@ -124,6 +127,7 @@ export function EventCreateModal({
 }: EventCreateModalProps) {
   const isEditMode = !!editingEvent;
   const [eventType, setEventType] = React.useState<"pomodoro" | "normal">("pomodoro");
+  const [blurtingMode, setBlurtingMode] = React.useState<"with_blurting" | "without_blurting">("with_blurting");
   const [showDeleteConfirm, setShowDeleteConfirm] = React.useState(false);
   const [categories, setCategories] = React.useState<Category[]>([]);
   const [isLoadingCategories, setIsLoadingCategories] = React.useState(false);
@@ -132,13 +136,15 @@ export function EventCreateModal({
   const [editingCategory, setEditingCategory] = React.useState<Category | null>(null);
   const [isEditingCategory, setIsEditingCategory] = React.useState(false);
 
+  const csrfToken = useCsrf();
+
   const [formState, setFormState] = React.useState<EventFormData>({
     title: "",
     description: "",
     startAt: "",
     endAt: "",
     isPomodoro: true,
-    inputDuration: 25,
+    inputDuration: 20,
     outputDuration: 5,
     longBreakDuration: 15,
     sets: 1,
@@ -179,9 +185,11 @@ export function EventCreateModal({
     return Math.max(15, differenceInMinutes(end, start));
   }, [formState.startAt, formState.endAt]);
 
-  // Check if using standard cycles (30 min each: 25 focus + 5 blurting)
-  const isStandardCycle = formState.inputDuration === STANDARD_FOCUS_DURATION &&
-    formState.outputDuration === STANDARD_BLURTING_DURATION;
+  // Check if using standard cycles
+  // With Blurting: 20-5-5
+  // Without Blurting: 25-0-5
+  const isStandardCycle = (formState.inputDuration === WITH_BLURTING_FOCUS && formState.outputDuration === WITH_BLURTING_OUTPUT) ||
+    (formState.inputDuration === WITHOUT_BLURTING_FOCUS && formState.outputDuration === WITHOUT_BLURTING_OUTPUT);
 
   // Total pomodoro time per cycle (focus + blurting)
   const totalCycleTime = formState.inputDuration + formState.outputDuration;
@@ -194,6 +202,29 @@ export function EventCreateModal({
   // Validation: pomodoro time should not exceed event duration AND duration must be >= 25 min
   const isPomodoroTimeValid = totalPomodoroTime <= eventDurationMinutes && eventDurationMinutes >= MIN_POMODORO_DURATION;
 
+  // Validation: pomodoro start time must not be in the past (only for new events)
+  const isPomodoroStartTimeValid = React.useMemo(() => {
+    if (!formState.startAt || eventType !== "pomodoro") return true;
+
+    // Check if the event overlaps with NOW (straddles current time)
+    const startDate = new Date(formState.startAt);
+    const endDate = new Date(formState.endAt);
+    const now = Date.now();
+
+    // "Now 53, cannot move to 45" -> Start <= Now < End
+    // If it's strictly in the past (End < Now), typically allowed for logs, but User emphasis was "overlap".
+    if (startDate.getTime() <= now && now < endDate.getTime()) {
+      return false;
+    }
+
+    // Original check: start must be in future for NEW events
+    if (!isEditMode) {
+      return startDate.getTime() > now;
+    }
+
+    return true;
+  }, [formState.startAt, formState.endAt, eventType, isEditMode]);
+
   // Update form when initial dates change
   React.useEffect(() => {
     if (initialDate && initialEndDate) {
@@ -204,7 +235,7 @@ export function EventCreateModal({
         ...prev,
         startAt: format(initialDate, "yyyy-MM-dd'T'HH:mm"),
         endAt: format(initialEndDate, "yyyy-MM-dd'T'HH:mm"),
-        inputDuration: pomodoroSettings?.inputDuration ?? 25,
+        inputDuration: pomodoroSettings?.inputDuration ?? 20,
         outputDuration: pomodoroSettings?.outputDuration ?? 5,
         longBreakDuration: pomodoroSettings?.longBreakDuration ?? 0,
         sets: pomodoroSettings?.sets ?? 1,
@@ -217,7 +248,7 @@ export function EventCreateModal({
         ...prev,
         startAt: format(initialDate, "yyyy-MM-dd'T'HH:mm"),
         endAt: format(endDate, "yyyy-MM-dd'T'HH:mm"),
-        inputDuration: pomodoroSettings?.inputDuration ?? 25,
+        inputDuration: pomodoroSettings?.inputDuration ?? 20,
         outputDuration: pomodoroSettings?.outputDuration ?? 5,
         longBreakDuration: pomodoroSettings?.longBreakDuration ?? 0,
         sets: pomodoroSettings?.sets ?? 1,
@@ -259,6 +290,13 @@ export function EventCreateModal({
         rrule: editingEvent.rrule,
       });
       setEventType(editingEvent.isPomodoro ? "pomodoro" : "normal");
+
+      // Infer blurting mode
+      if (editingEvent.outputDuration > 0) {
+        setBlurtingMode("with_blurting");
+      } else {
+        setBlurtingMode("without_blurting");
+      }
     }
   }, [editingEvent, isOpen]);
 
@@ -271,7 +309,7 @@ export function EventCreateModal({
         startAt: "",
         endAt: "",
         isPomodoro: true,
-        inputDuration: 25,
+        inputDuration: 20,
         outputDuration: 5,
         longBreakDuration: 15,
         sets: 1,
@@ -282,6 +320,7 @@ export function EventCreateModal({
         rrule: null,
       });
       setEventType("pomodoro");
+      setBlurtingMode("with_blurting");
       setShowDeleteConfirm(false);
     }
   }, [isOpen]);
@@ -300,7 +339,10 @@ export function EventCreateModal({
     try {
       const response = await fetch("/api/categories", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken || "",
+        },
         body: JSON.stringify({ title, color }),
       });
 
@@ -330,7 +372,10 @@ export function EventCreateModal({
     try {
       const response = await fetch("/api/categories", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken || "",
+        },
         body: JSON.stringify({ id, title, color }),
       });
 
@@ -362,6 +407,9 @@ export function EventCreateModal({
     try {
       const response = await fetch(`/api/categories?id=${id}`, {
         method: "DELETE",
+        headers: {
+          "X-CSRF-Token": csrfToken || "",
+        },
       });
 
       if (response.ok) {
@@ -397,12 +445,34 @@ export function EventCreateModal({
 
     // For custom cycles, ensure total (focus + blurting) doesn't exceed event duration
     // Blurting = 5, so max focus = eventDuration - 5
-    const maxFocus = eventDurationMinutes - STANDARD_BLURTING_DURATION;
+    const maxFocus = eventDurationMinutes - WITH_BLURTING_OUTPUT;
 
     if (field === "inputDuration") {
       setFormState((prev) => ({
         ...prev,
         inputDuration: Math.min(newValue, maxFocus),
+      }));
+    } else {
+      setFormState((prev) => ({
+        ...prev,
+        outputDuration: newValue,
+      }));
+    }
+  };
+
+  const handleBlurtingModeChange = (mode: "with_blurting" | "without_blurting") => {
+    setBlurtingMode(mode);
+    if (mode === "with_blurting") {
+      setFormState((prev) => ({
+        ...prev,
+        inputDuration: WITH_BLURTING_FOCUS, // 20
+        outputDuration: WITH_BLURTING_OUTPUT, // 5
+      }));
+    } else {
+      setFormState((prev) => ({
+        ...prev,
+        inputDuration: WITHOUT_BLURTING_FOCUS, // 25
+        outputDuration: WITHOUT_BLURTING_OUTPUT, // 0
       }));
     }
   };
@@ -410,6 +480,7 @@ export function EventCreateModal({
   const handleSubmit = () => {
     if (!formState.title || !formState.startAt || !formState.endAt) return;
     if (eventType === "pomodoro" && !isPomodoroTimeValid) return;
+    if (eventType === "pomodoro" && !isPomodoroStartTimeValid) return;
 
     // Generate RRULE from recurrence config
     const startDate = new Date(formState.startAt);
@@ -598,10 +669,10 @@ export function EventCreateModal({
             <div className="flex gap-3">
               <button
                 className={`flex h-10 items-center justify-center gap-2 px-5 rounded-lg font-medium text-sm transition-all shadow-sm ${eventType === "pomodoro"
-                    ? "bg-primary text-primary-foreground"
-                    : eventDurationMinutes < MIN_POMODORO_DURATION
-                      ? "bg-muted/50 text-muted-foreground/50 cursor-not-allowed"
-                      : "bg-muted text-muted-foreground hover:bg-muted/80"
+                  ? "bg-primary text-primary-foreground"
+                  : eventDurationMinutes < MIN_POMODORO_DURATION
+                    ? "bg-muted/50 text-muted-foreground/50 cursor-not-allowed"
+                    : "bg-muted text-muted-foreground hover:bg-muted/80"
                   }`}
                 onClick={() => eventDurationMinutes >= MIN_POMODORO_DURATION && handleEventTypeChange("pomodoro")}
                 disabled={eventDurationMinutes < MIN_POMODORO_DURATION}
@@ -627,11 +698,29 @@ export function EventCreateModal({
                 <span>Pomodoro requires at least 25 minutes. Current: {eventDurationMinutes} min</span>
               </div>
             )}
-            {/* Focus only mode indicator */}
-            {eventType === "pomodoro" && eventDurationMinutes >= MIN_POMODORO_DURATION && eventDurationMinutes < MIN_POMODORO_WITH_BREAK_DURATION && (
-              <div className="flex items-center gap-2 text-xs text-blue-600 bg-blue-50 dark:bg-blue-900/20 px-3 py-2 rounded-lg">
-                <span className="material-symbols-outlined text-sm">self_improvement</span>
-                <span>Focus Only Mode: 25 min focus, no blurting phase</span>
+            {/* Blurting Mode Toggle */}
+            {eventType === "pomodoro" && eventDurationMinutes >= MIN_POMODORO_WITH_BREAK_DURATION && (
+              <div className="flex p-1 bg-muted rounded-lg mt-2">
+                <button
+                  className={`flex-1 flex items-center justify-center gap-2 py-1.5 rounded-md text-xs font-medium transition-all ${blurtingMode === "with_blurting"
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:bg-card/50"
+                    }`}
+                  onClick={() => handleBlurtingModeChange("with_blurting")}
+                >
+                  <span className="material-symbols-outlined text-[16px]">edit_note</span>
+                  With Blurting (20-5-5)
+                </button>
+                <button
+                  className={`flex-1 flex items-center justify-center gap-2 py-1.5 rounded-md text-xs font-medium transition-all ${blurtingMode === "without_blurting"
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:bg-card/50"
+                    }`}
+                  onClick={() => handleBlurtingModeChange("without_blurting")}
+                >
+                  <span className="material-symbols-outlined text-[16px]">do_not_disturb</span>
+                  Without Blurting (25-5)
+                </button>
               </div>
             )}
           </div>
@@ -694,7 +783,9 @@ export function EventCreateModal({
                     </span>
                     <span className="text-[10px] text-muted-foreground/70">
                       {isStandardCycle
-                        ? `Standard cycle: 20-5-5 × ${formState.sets} = ${totalPomodoroTime} min`
+                        ? blurtingMode === "with_blurting"
+                          ? `Standard cycle (With Blurting): 20-5-5 × ${formState.sets} = ${totalPomodoroTime} min`
+                          : `Standard cycle (Without Blurting): 25-5 × ${formState.sets} = ${totalPomodoroTime} min`
                         : `Custom: ${formState.inputDuration}-${formState.outputDuration}-5 = ${totalCycleTime} min`
                       }
                     </span>
@@ -731,14 +822,21 @@ export function EventCreateModal({
                         <div className="text-[10px] text-muted-foreground">Focus</div>
                       </div>
                     </div>
-                    <span className="text-muted-foreground">→</span>
-                    <div className="flex items-center gap-2">
-                      <span className="material-symbols-outlined text-amber-500 text-lg">edit_note</span>
-                      <div>
-                        <div className="font-bold text-amber-600">{formState.outputDuration} min</div>
-                        <div className="text-[10px] text-muted-foreground">Blurting</div>
-                      </div>
-                    </div>
+
+                    {/* Show Blurting only if output > 0 */}
+                    {formState.outputDuration > 0 && (
+                      <>
+                        <span className="text-muted-foreground">→</span>
+                        <div className="flex items-center gap-2">
+                          <span className="material-symbols-outlined text-amber-500 text-lg">edit_note</span>
+                          <div>
+                            <div className="font-bold text-amber-600">{formState.outputDuration} min</div>
+                            <div className="text-[10px] text-muted-foreground">Blurting</div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+
                     <span className="text-muted-foreground">→</span>
                     <div className="flex items-center gap-2">
                       <span className="material-symbols-outlined text-green-500 text-lg">coffee</span>
@@ -897,11 +995,17 @@ export function EventCreateModal({
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-4 bg-muted/30 border-t border-border flex items-center justify-end">
+        <div className="px-6 py-4 bg-muted/30 border-t border-border flex items-center justify-between">
+          {/* Validation error message */}
+          <div className="text-sm text-destructive">
+            {eventType === "pomodoro" && !isPomodoroStartTimeValid && (
+              <span>Since starting is already past, you cannot create a pomodoro</span>
+            )}
+          </div>
           <button
             className="px-10 py-2.5 bg-primary text-primary-foreground text-sm font-bold rounded-lg shadow-lg shadow-primary/25 hover:shadow-primary/40 hover:brightness-110 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             onClick={handleSubmit}
-            disabled={isSubmitting || !formState.title || (eventType === "pomodoro" && !isPomodoroTimeValid)}
+            disabled={isSubmitting || !formState.title || (eventType === "pomodoro" && (!isPomodoroTimeValid || !isPomodoroStartTimeValid))}
           >
             {isSubmitting ? "Saving..." : isEditMode ? "Update Task" : "Save Task"}
           </button>

@@ -71,7 +71,7 @@ export function useNotifications() {
 
   // Send timer phase notification
   const notifyPhaseChange = useCallback(
-    (phase: "input" | "output" | "completed", eventTitle?: string) => {
+    (phase: "input" | "output" | "break" | "completed", eventTitle?: string) => {
       let title: string;
       let body: string;
 
@@ -85,6 +85,12 @@ export function useNotifications() {
           body = eventTitle
             ? `${eventTitle} - Time to write what you remember!`
             : "Time to write what you remember!";
+          break;
+        case "break":
+          title = "☕ Break Time!";
+          body = eventTitle
+            ? `${eventTitle} - Take a well-deserved rest.`
+            : "Take a well-deserved rest. Don't forget to submit feedback!";
           break;
         case "completed":
           title = "🎉 Session Complete!";

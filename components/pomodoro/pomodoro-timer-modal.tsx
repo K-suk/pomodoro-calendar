@@ -15,9 +15,10 @@ type PomodoroTimerModalProps = {
   eventEndAt: string; // ISO string
   // External timer state (managed by parent)
   timerState?: PomodoroState;
-  // Debug functions (remove later)
-  onDebugSkip1Min?: () => void;
-  onDebugSkip10Min?: () => void;
+  // Feedback props
+  feedbackText?: string;
+  onFeedbackChange?: (text: string) => void;
+  onFeedbackSubmit?: () => void;
 };
 
 // Check if current time is within event time range
@@ -38,8 +39,9 @@ export function PomodoroTimerModal({
   eventStartAt,
   eventEndAt,
   timerState,
-  onDebugSkip1Min,
-  onDebugSkip10Min,
+  feedbackText = "",
+  onFeedbackChange,
+  onFeedbackSubmit,
 }: PomodoroTimerModalProps) {
   const [completedSessions] = React.useState(0);
 
@@ -61,9 +63,11 @@ export function PomodoroTimerModal({
     ? "Focus Session"
     : state.phase === "output"
       ? "Blurting Time"
-      : state.phase === "completed"
-        ? "Session Complete"
-        : "Ready";
+      : state.phase === "break"
+        ? "Break Time"
+        : state.phase === "completed"
+          ? "Session Complete"
+          : "Ready";
 
   // Check if we're within the event time
   const withinEventTime = isWithinEventTime(eventStartAt, eventEndAt);
@@ -158,40 +162,49 @@ export function PomodoroTimerModal({
               </p>
             </div>
 
-            {/* Message - different for focus vs break */}
-            <div className="mt-6 text-center">
-              {state.phase === "output" ? (
-                <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
-                  Break time • Click outside to minimize
-                </p>
-              ) : (
-                <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
-                  Stay focused • No escape
-                </p>
-              )}
-            </div>
-
-            {/* Debug buttons (remove later) */}
-            {(onDebugSkip1Min || onDebugSkip10Min) && (
-              <div className="mt-6 flex gap-2 justify-center">
-                {onDebugSkip1Min && (
+            {/* Break / Feedback Section */}
+            {state.phase === "break" ? (
+              <div className="mt-8 w-full max-w-sm animate-in fade-in slide-in-from-bottom-4 duration-500">
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold uppercase tracking-wider text-green-600">
+                      Session Feedback
+                    </label>
+                    <span className="text-[10px] text-muted-foreground">
+                      Memo for yourself
+                    </span>
+                  </div>
+                  <textarea
+                    className="w-full h-32 p-3 text-sm bg-muted/50 border border-border rounded-lg resize-none focus:outline-none focus:ring-1 focus:ring-primary transition-all placeholder:text-muted-foreground/50"
+                    placeholder="What did you accomplish? Any thoughts?"
+                    value={feedbackText}
+                    onChange={(e) => onFeedbackChange?.(e.target.value)}
+                    autoFocus
+                  />
                   <button
-                    onClick={onDebugSkip1Min}
-                    className="px-3 py-1 text-xs bg-orange-500 text-white rounded hover:bg-orange-600"
+                    onClick={onFeedbackSubmit}
+                    className="w-full py-2 bg-primary text-primary-foreground text-xs font-bold uppercase tracking-wider rounded-lg hover:brightness-110 active:scale-95 transition-all shadow-lg shadow-primary/20"
                   >
-                    +1分
+                    Save Feedback
                   </button>
-                )}
-                {onDebugSkip10Min && (
-                  <button
-                    onClick={onDebugSkip10Min}
-                    className="px-3 py-1 text-xs bg-red-500 text-white rounded hover:bg-red-600"
-                  >
-                    +10分
-                  </button>
+                </div>
+              </div>
+            ) : (
+              /* Message - different for focus vs output */
+              <div className="mt-6 text-center">
+                {state.phase === "output" ? (
+                  <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
+                    Blurting time • Write everything down!
+                  </p>
+                ) : (
+                  <p className="text-[10px] text-muted-foreground/60 uppercase tracking-widest">
+                    Stay focused • No escape
+                  </p>
                 )}
               </div>
             )}
+
+
           </div>
         </div>
       </div>
@@ -212,7 +225,7 @@ export function MiniTimer({
   onClick: () => void;
 }) {
   const timeDisplay = formatTime(remainingSeconds);
-  const phaseColor = phase === "input" ? "text-primary" : phase === "output" ? "text-amber-500" : "text-muted-foreground";
+  const phaseColor = phase === "input" ? "text-primary" : phase === "output" ? "text-amber-500" : phase === "break" ? "text-green-500" : "text-muted-foreground";
 
   return (
     <button

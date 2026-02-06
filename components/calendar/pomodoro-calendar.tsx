@@ -32,6 +32,7 @@ import { usePomodoroTimer, type PomodoroPhase } from "@/hooks/use-pomodoro-timer
 import { useBlurtingSession } from "@/hooks/use-blurting-session";
 import { BlurtingModal } from "@/components/pomodoro/blurting-modal";
 import { useNotifications } from "@/hooks/use-notifications";
+import { useCsrf } from "@/hooks/use-csrf";
 
 // Find the current active pomodoro event
 function findActivePomodoro(events: EventRecord[]): EventRecord | null {
@@ -96,12 +97,13 @@ const formatHour = (hour: number) => {
 };
 
 export function PomodoroCalendar() {
+  const csrfToken = useCsrf();
   const [currentDate, setCurrentDate] = React.useState(new Date());
   const [miniCalendarDate, setMiniCalendarDate] = React.useState(new Date());
   const [events, setEvents] = React.useState<EventRecord[]>([]);
   const [dialogOpen, setDialogOpen] = React.useState(false);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
-  const [searchQuery, setSearchQuery] = React.useState("");
+  // searchQuery state removed
   const scrollContainerRef = React.useRef<HTMLDivElement>(null);
   const gridRef = React.useRef<HTMLDivElement>(null);
   const [timerModalOpen, setTimerModalOpen] = React.useState(false);
@@ -117,6 +119,8 @@ export function PomodoroCalendar() {
 
   // Blurting session hook (must be declared before handlePhaseChange)
   const blurtingSession = useBlurtingSession();
+  // Separate feedback text state for Break phase
+  const [feedbackText, setFeedbackText] = React.useState("");
 
   // Notifications hook
   const notifications = useNotifications();
@@ -137,6 +141,10 @@ export function PomodoroCalendar() {
       blurtingSession.startSession();
       setShowBlurtingModal(true);
       setTimerModalOpen(false);
+    } else if (phase === "break") {
+      // Ensure timer modal is open for feedback
+      setTimerModalOpen(true);
+      setShowBlurtingModal(false);
     }
   }, [blurtingSession, notifications, activePomodoro?.title]);
 
@@ -188,16 +196,29 @@ export function PomodoroCalendar() {
 
   // Auto-complete session when blurting timer reaches 0 (phase becomes "completed")
   React.useEffect(() => {
-    if (persistentTimer.state.phase === "completed" && activePomodoro && showBlurtingModal) {
-      // Timer ended - auto-complete the session
-      const blurtingText = blurtingSession.state.blurtingText;
-      blurtingSession.endSession();
-      setShowBlurtingModal(false);
-      handleTimerComplete(blurtingText);
-      // Send completion notification
-      notifications.notifyPhaseChange("completed", activePomodoro.title);
-      setActivePomodoro(null);
-      persistentTimer.reset();
+    if (persistentTimer.state.phase === "completed" && activePomodoro) {
+      if (showBlurtingModal) {
+        // Timer ended during blurting - auto-complete
+        const finalBlurtingText = blurtingSession.state.blurtingText;
+        blurtingSession.endSession();
+        setShowBlurtingModal(false);
+        handleTimerComplete(finalBlurtingText, feedbackText);
+        notifications.notifyPhaseChange("completed", activePomodoro.title);
+        setActivePomodoro(null);
+        persistentTimer.reset();
+        setFeedbackText(""); // Clear feedback
+      } else if (persistentTimer.state.phase === "completed") {
+        // Must be end of Break (or Focus-only)
+        // Auto-save any feedback text
+        const finalBlurtingText = blurtingSession.state.blurtingText;
+        blurtingSession.endSession();
+        setTimerModalOpen(false);
+        handleTimerComplete(finalBlurtingText, feedbackText);
+        notifications.notifyPhaseChange("completed", activePomodoro.title);
+        setActivePomodoro(null);
+        persistentTimer.reset();
+        setFeedbackText(""); // Clear feedback
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [persistentTimer.state.phase]);
@@ -630,6 +651,23 @@ export function PomodoroCalendar() {
 
         const event = events.find(e => e.id === currentActiveId);
         if (event) {
+          // Check if Pomodoro event straddles current time
+          if (event.isPomodoro) {
+            const nowTime = now.getTime();
+            const newStartTime = newStart.getTime();
+            const newEndTime = newEnd.getTime();
+
+            // If the new time range overlaps with "now" (start <= now < end)
+            // But we allow if it was ALREADY active and we are just adjusting it?
+            // User request: "cannot move TO a place that straddles now"
+            // If it is straddling, it becomes active.
+            if (newStartTime <= nowTime && nowTime < newEndTime) {
+              setCompletedPomodoroWarning(true); // Re-use this warning state or create a new one
+              // Reset drag state handled by the outer setDragState call
+              return;
+            }
+          }
+
           // Optimistic UI Update - instant visual feedback
           setEvents(prev => prev.map(e => e.id === event.id ? {
             ...e,
@@ -640,7 +678,10 @@ export function PomodoroCalendar() {
           // Sync with server in background (fire-and-forget, no state update on response)
           fetch("/api/events", {
             method: "PUT",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrfToken || "",
+            },
             body: JSON.stringify({
               id: event.id,
               title: event.title,
@@ -664,6 +705,19 @@ export function PomodoroCalendar() {
 
         const event = events.find(e => e.id === currentActiveId);
         if (event) {
+          // Check if Pomodoro event straddles current time after resize
+          if (event.isPomodoro) {
+            const nowTime = now.getTime();
+            const startTime = currentInitialStart.getTime(); // Resize doesn't change start
+            const newEndTime = newEnd.getTime();
+
+            // If resizing makes it straddle now (start <= now < end)
+            if (startTime <= nowTime && nowTime < newEndTime) {
+              setCompletedPomodoroWarning(true);
+              return;
+            }
+          }
+
           // Optimistic UI Update - instant visual feedback
           setEvents(prev => prev.map(e => e.id === event.id ? {
             ...e,
@@ -673,7 +727,10 @@ export function PomodoroCalendar() {
           // Sync with server in background (fire-and-forget, no state update on response)
           fetch("/api/events", {
             method: "PUT",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              "X-CSRF-Token": csrfToken || "",
+            },
             body: JSON.stringify({
               id: event.id,
               title: event.title,
@@ -733,7 +790,10 @@ export function PomodoroCalendar() {
 
     const response = await fetch("/api/events", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken || "",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -905,7 +965,10 @@ export function PomodoroCalendar() {
 
     const response = await fetch("/api/events", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken || "",
+      },
       body: JSON.stringify(payload),
     });
 
@@ -925,6 +988,9 @@ export function PomodoroCalendar() {
 
     const response = await fetch(`/api/events?id=${eventId}`, {
       method: "DELETE",
+      headers: {
+        "X-CSRF-Token": csrfToken || "",
+      },
     });
 
     if (response.ok) {
@@ -944,7 +1010,7 @@ export function PomodoroCalendar() {
     setIsSubmitting(false);
   };
 
-  const handleTimerComplete = async (blurtingText: string) => {
+  const handleTimerComplete = async (blurtingText: string, feedback?: string) => {
     if (!activePomodoro) return;
 
     try {
@@ -952,10 +1018,12 @@ export function PomodoroCalendar() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken || "",
         },
         body: JSON.stringify({
           eventId: activePomodoro.id,
           blurtingText,
+          sessionFeedback: feedback,
           inputMinutes: activePomodoro.inputDuration,
           outputMinutes: activePomodoro.outputDuration,
         }),
@@ -1038,11 +1106,9 @@ export function PomodoroCalendar() {
       {/* Header */}
       <header className="flex items-center justify-between border-b border-border px-4 py-2 bg-card z-20">
         <div className="flex items-center gap-8">
-          <div className="flex items-center gap-3">
-            <div className="text-primary">
-              <span className="material-symbols-outlined text-3xl">event_repeat</span>
-            </div>
-            <h1 className="text-xl font-medium tracking-tight">Pomodoro</h1>
+          <div className="flex items-center gap-1">
+            <img src="/images/logo.png" alt="Kizami" className="size-8 pb-2" />
+            <h1 className="text-xl font-bold tracking-tight">Kizami</h1>
           </div>
           <div className="flex items-center gap-4">
             <Button
@@ -1072,33 +1138,16 @@ export function PomodoroCalendar() {
           </div>
         </div>
         <div className="flex items-center gap-4">
-          {/* Show Mini Timer when pomodoro is active, otherwise show search */}
-          {activePomodoro && persistentTimer.state.phase !== "idle" ? (
+          {/* Show Mini Timer when pomodoro is active */}
+          {activePomodoro && persistentTimer.state.phase !== "idle" && (
             <MiniTimer
               remainingSeconds={persistentTimer.state.remainingSeconds}
               phase={persistentTimer.state.phase}
               eventTitle={activePomodoro.title}
               onClick={() => setTimerModalOpen(true)}
             />
-          ) : (
-            <div className="relative flex items-center bg-muted rounded-lg px-3 py-1.5 w-64">
-              <span className="material-symbols-outlined text-muted-foreground text-lg mr-2">search</span>
-              <input
-                className="bg-transparent border-none focus:ring-0 text-sm p-0 w-full placeholder-muted-foreground focus:outline-none"
-                placeholder="Search events"
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
-            </div>
           )}
           <div className="flex items-center gap-2 border-l border-border pl-4 ml-2">
-            <button className="p-2 rounded-full hover:bg-muted transition-colors">
-              <span className="material-symbols-outlined">help</span>
-            </button>
-            <button className="p-2 rounded-full hover:bg-muted transition-colors">
-              <span className="material-symbols-outlined">settings</span>
-            </button>
             <div className="ml-2">
               <AuthButton />
             </div>
@@ -1171,118 +1220,73 @@ export function PomodoroCalendar() {
           </div>
 
           {/* Calendar Filters */}
-          <div className="flex flex-col gap-2">
-            <h3 className="text-xs font-bold text-muted-foreground uppercase tracking-wider px-2 mb-2">
-              My Calendars
-            </h3>
-            <label className="flex items-center gap-3 px-2 py-1.5 hover:bg-muted rounded cursor-pointer">
-              <input
-                type="checkbox"
-                defaultChecked
-                className="rounded border-border text-primary focus:ring-primary h-4 w-4"
-              />
-              <span className="text-sm">Deep Work</span>
-            </label>
-            <label className="flex items-center gap-3 px-2 py-1.5 hover:bg-muted rounded cursor-pointer">
-              <input
-                type="checkbox"
-                defaultChecked
-                className="rounded border-border text-primary focus:ring-primary h-4 w-4"
-              />
-              <span className="text-sm">Quick Break</span>
-            </label>
-            <label className="flex items-center gap-3 px-2 py-1.5 hover:bg-muted rounded cursor-pointer">
-              <input
-                type="checkbox"
-                defaultChecked
-                className="rounded border-border text-primary focus:ring-primary h-4 w-4"
-              />
-              <span className="text-sm">Meetings</span>
-            </label>
-          </div>
         </aside>
 
         {/* Main Calendar */}
-        <main className="flex-1 flex flex-col overflow-hidden bg-card">
-          {/* Days Header */}
-          <div className="calendar-grid border-b border-border sticky top-0 bg-card z-10">
-            <div className="w-16"></div>
-            {weekDays.map((day, i) => (
-              <div key={i} className="flex flex-col items-center py-3">
-                <span className="text-[11px] font-bold text-muted-foreground uppercase">
-                  {WEEKDAYS[getDay(day)]}
-                </span>
-                <span
-                  className={`text-2xl font-light ${isToday(day) ? "bg-primary text-primary-foreground rounded-full w-10 h-10 flex items-center justify-center" : ""
-                    }`}
-                >
-                  {format(day, "d")}
-                </span>
-              </div>
-            ))}
-          </div>
+        <main className="flex-1 flex flex-col overflow-x-auto overflow-y-hidden bg-card">
+          <div className="flex flex-col h-full min-w-[800px]">
+            {/* Days Header */}
+            <div className="calendar-grid border-b border-border sticky top-0 bg-card z-10">
+              <div className="w-16"></div>
+              {
+                weekDays.map((day, i) => (
+                  <div key={i} className="flex flex-col items-center py-3">
+                    <span className="text-[11px] font-bold text-muted-foreground uppercase">
+                      {WEEKDAYS[getDay(day)]}
+                    </span>
+                    <span
+                      className={`text-2xl font-light ${isToday(day) ? "bg-primary text-primary-foreground rounded-full w-10 h-10 flex items-center justify-center" : ""
+                        }`}
+                    >
+                      {format(day, "d")}
+                    </span>
+                  </div>
+                ))
+              }
+            </div>
 
-          {/* Time Grid */}
-          <div
-            ref={scrollContainerRef}
-            className={`flex-1 overflow-y-auto relative ${dragState.isDragging ? "select-none" : ""}`}
-          >
-            {/* Current Time Indicator */}
-            {weekDays.some((day) => isToday(day)) && (
-              <div
-                className="absolute left-0 right-0 z-20 flex items-center pointer-events-none"
-                style={{
-                  top: `${currentTimePosition}px`,
-                  transform: 'translateY(-50%)'
-                }}
-              >
-                <div className="w-16 flex justify-end pr-2">
-                  <span className="bg-primary text-primary-foreground text-[10px] px-1.5 py-0.5 rounded-sm font-bold shadow-sm">
-                    {format(now, "h:mm")}
-                  </span>
-                </div>
-                <div className="flex-1 h-[2px] bg-primary relative">
-                  <div className="absolute -left-1 -top-[4px] w-2.5 h-2.5 rounded-full bg-primary border-2 border-card shadow-sm"></div>
-                </div>
-              </div>
-            )}
-
-            <div ref={gridRef} className="calendar-grid relative">
-              {/* Column lines */}
-              <div className="absolute inset-0 flex pointer-events-none">
-                <div className="w-16 border-r border-border"></div>
-                {weekDays.map((_, i) => (
-                  <div key={i} className="flex-1 border-r border-border last:border-r-0"></div>
-                ))}
-              </div>
-
-              {/* Drag Preview */}
-              {dragPreview && (
-                dragPreview.type === 'create' ? (
+            {/* Time Grid */}
+            <div
+              ref={scrollContainerRef}
+              className={`flex-1 overflow-y-auto relative ${dragState.isDragging ? "select-none" : ""}`}
+            >
+              {/* Current Time Indicator */}
+              {
+                weekDays.some((day) => isToday(day)) && (
                   <div
-                    ref={dragPreviewRef}
-                    className="absolute bg-primary/30 border-2 border-primary border-dashed rounded-lg z-30 pointer-events-none"
+                    className="absolute left-0 right-0 z-20 flex items-center pointer-events-none"
                     style={{
-                      top: dragPreview.top,
-                      height: dragPreview.height,
-                      left: dragPreview.left,
-                      width: dragPreview.width,
+                      top: `${currentTimePosition}px`,
+                      transform: 'translateY(-50%)'
                     }}
                   >
-                    <div className="p-2 text-xs font-medium text-primary time-display">
-                      {format(addMinutes(startOfDay(dragState.startDay!), Math.min(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
-                      {" - "}
-                      {format(addMinutes(startOfDay(dragState.startDay!), Math.max(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
+                    <div className="w-16 flex justify-end pr-2">
+                      <span className="bg-primary text-primary-foreground text-[10px] px-1.5 py-0.5 rounded-sm font-bold shadow-sm">
+                        {format(now, "h:mm")}
+                      </span>
+                    </div>
+                    <div className="flex-1 h-[2px] bg-primary relative">
+                      <div className="absolute -left-1 -top-[4px] w-2.5 h-2.5 rounded-full bg-primary border-2 border-card shadow-sm"></div>
                     </div>
                   </div>
-                ) : (
-                  dragPreview.event && (
+                )
+              }
+
+              <div ref={gridRef} className="calendar-grid relative">
+                {/* Column lines */}
+                <div className="absolute inset-0 flex pointer-events-none">
+                  <div className="w-16 border-r border-border"></div>
+                  {weekDays.map((_, i) => (
+                    <div key={i} className="flex-1 border-r border-border last:border-r-0"></div>
+                  ))}
+                </div>
+
+                {/* Drag Preview */}
+                {dragPreview && (
+                  dragPreview.type === 'create' ? (
                     <div
                       ref={dragPreviewRef}
-                      className={`absolute p-2 rounded-lg text-xs font-medium shadow-lg z-30 overflow-hidden pointer-events-none opacity-80 ${dragPreview.event.isPomodoro
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-primary/10 text-primary border-l-4 border-primary"
-                        }`}
+                      className="absolute bg-primary/30 border-2 border-primary border-dashed rounded-lg z-30 pointer-events-none"
                       style={{
                         top: dragPreview.top,
                         height: dragPreview.height,
@@ -1290,101 +1294,123 @@ export function PomodoroCalendar() {
                         width: dragPreview.width,
                       }}
                     >
-                      <div className="flex items-center justify-between mb-0.5">
-                        <span className="truncate">{dragPreview.event.title}</span>
-                        {dragPreview.event.isPomodoro && (
-                          <span className="material-symbols-outlined text-[14px]">timer</span>
-                        )}
+                      <div className="p-2 text-xs font-medium text-primary time-display">
+                        {format(addMinutes(startOfDay(dragState.startDay!), Math.min(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
+                        {" - "}
+                        {format(addMinutes(startOfDay(dragState.startDay!), Math.max(dragState.startMinutes, dragState.currentMinutes)), "h:mm a")}
                       </div>
-                      <span className={`text-[10px] time-display ${dragPreview.event.isPomodoro ? "opacity-80" : ""}`}>
-                        {/* Calculate time based on current position */}
-                        {dragState.mode === 'move' ? (
-                          <>
-                            {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes), "h:mm")} -{" "}
-                            {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes + differenceInMinutes(new Date(dragPreview.event.endAt), new Date(dragPreview.event.startAt))), "h:mm a")}
-                          </>
-                        ) : (
-                          <>
-                            {format(new Date(dragPreview.event.startAt), "h:mm")} -{" "}
-                            {format(addMinutes(startOfDay(dragState.startDay!), dragState.currentMinutes), "h:mm a")}
-                          </>
-                        )}
-                      </span>
                     </div>
-                  )
-                )
-              )}
-
-              {/* Time rows */}
-              {HOURS.map((hour) => (
-                <React.Fragment key={hour}>
-                  <div className="time-label text-right pr-3 text-[11px] text-muted-foreground pt-1 border-r border-border">
-                    {formatHour(hour)}
-                  </div>
-                  {weekDays.map((day, dayIndex) => {
-                    const dayKey = format(day, "yyyy-MM-dd");
-                    const dayEvents = getEventsForDay(day).filter((event) => {
-                      const eventHour = new Date(event.startAt).getHours();
-                      return eventHour === hour;
-                    });
-
-                    return (
+                  ) : (
+                    dragPreview.event && (
                       <div
-                        key={dayIndex}
-                        className="time-slot relative cursor-crosshair hover:bg-primary/5 transition-colors"
-                        onMouseDown={(e) => handleMouseDown(e, day, hour)}
+                        ref={dragPreviewRef}
+                        className={`absolute p-2 rounded-lg text-xs font-medium shadow-lg z-30 overflow-hidden pointer-events-none opacity-80 ${dragPreview.event.isPomodoro
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-primary/10 text-primary border-l-4 border-primary"
+                          }`}
+                        style={{
+                          top: dragPreview.top,
+                          height: dragPreview.height,
+                          left: dragPreview.left,
+                          width: dragPreview.width,
+                        }}
                       >
-                        {dayEvents.map((event) => {
-                          const style = getEventStyle(event, dayKey);
-                          const isPomodoroEvent = event.isPomodoro;
-
-                          return (
-                            <div
-                              key={event.id}
-                              className={`absolute rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden hover:opacity-90 transition-opacity ${isPomodoroEvent
-                                ? "bg-primary text-primary-foreground"
-                                : "bg-primary/10 text-primary border-l-4 border-primary"
-                                } ${dragState.activeEventId === event.id ? "opacity-50 pointer-events-none" : "cursor-pointer"}`}
-                              style={style}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleEventClick(event, e);
-                              }}
-                              onMouseDown={(e) => handleEventMouseDown(e, event, day)}
-                            >
-                              <div className="p-2 h-full flex flex-col">
-                                <div className="flex items-center justify-between mb-0.5 pointer-events-none">
-                                  <span className="truncate">{event.title}</span>
-                                  {isPomodoroEvent && (
-                                    <span className="material-symbols-outlined text-[14px]" title="Click to start timer">timer</span>
-                                  )}
-                                </div>
-                                <span className={`text-[10px] pointer-events-none ${isPomodoroEvent ? "opacity-80" : ""}`}>
-                                  {format(new Date(event.startAt), "h:mm")} -{" "}
-                                  {format(new Date(event.endAt), "h:mm a")}
-                                </span>
-                              </div>
-
-                              {/* Resize Handle */}
-                              <div
-                                className="absolute bottom-0 left-0 right-0 h-3 cursor-s-resize hover:bg-black/10 z-20"
-                                onMouseDown={(e) => handleResizeMouseDown(e, event, day)}
-                              />
-                            </div>
-                          );
-                        })}
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className="truncate">{dragPreview.event.title}</span>
+                          {dragPreview.event.isPomodoro && (
+                            <span className="material-symbols-outlined text-[14px]">timer</span>
+                          )}
+                        </div>
+                        <span className={`text-[10px] time-display ${dragPreview.event.isPomodoro ? "opacity-80" : ""}`}>
+                          {/* Calculate time based on current position */}
+                          {dragState.mode === 'move' ? (
+                            <>
+                              {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes), "h:mm")} -{" "}
+                              {format(addMinutes(startOfDay(dragState.currentDay || dragState.startDay!), dragState.currentMinutes + differenceInMinutes(new Date(dragPreview.event.endAt), new Date(dragPreview.event.startAt))), "h:mm a")}
+                            </>
+                          ) : (
+                            <>
+                              {format(new Date(dragPreview.event.startAt), "h:mm")} -{" "}
+                              {format(addMinutes(startOfDay(dragState.startDay!), dragState.currentMinutes), "h:mm a")}
+                            </>
+                          )}
+                        </span>
                       </div>
-                    );
-                  })}
-                </React.Fragment>
-              ))}
+                    )
+                  )
+                )}
+
+                {/* Time rows */}
+                {HOURS.map((hour) => (
+                  <React.Fragment key={hour}>
+                    <div className="time-label text-right pr-3 text-[11px] text-muted-foreground pt-5 border-r border-border">
+                      {formatHour(hour)}
+                    </div>
+                    {weekDays.map((day, dayIndex) => {
+                      const dayKey = format(day, "yyyy-MM-dd");
+                      const dayEvents = getEventsForDay(day).filter((event) => {
+                        const eventHour = new Date(event.startAt).getHours();
+                        return eventHour === hour;
+                      });
+
+                      return (
+                        <div
+                          key={dayIndex}
+                          className="time-slot relative cursor-crosshair hover:bg-primary/5 transition-colors"
+                          onMouseDown={(e) => handleMouseDown(e, day, hour)}
+                        >
+                          {dayEvents.map((event) => {
+                            const style = getEventStyle(event, dayKey);
+                            const isPomodoroEvent = event.isPomodoro;
+
+                            return (
+                              <div
+                                key={event.id}
+                                className={`absolute rounded-lg text-xs font-medium shadow-sm z-10 overflow-hidden hover:opacity-90 transition-opacity ${isPomodoroEvent
+                                  ? "bg-primary text-primary-foreground"
+                                  : "bg-primary/10 text-primary border-l-4 border-primary"
+                                  } ${dragState.activeEventId === event.id ? "opacity-50 pointer-events-none" : "cursor-pointer"}`}
+                                style={style}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleEventClick(event, e);
+                                }}
+                                onMouseDown={(e) => handleEventMouseDown(e, event, day)}
+                              >
+                                <div className="p-2 h-full flex flex-col">
+                                  <div className="flex items-center justify-between mb-0.5 pointer-events-none">
+                                    <span className="truncate">{event.title}</span>
+                                    {isPomodoroEvent && (
+                                      <span className="material-symbols-outlined text-[14px]" title="Click to start timer">timer</span>
+                                    )}
+                                  </div>
+                                  <span className={`text-[10px] pointer-events-none ${isPomodoroEvent ? "opacity-80" : ""}`}>
+                                    {format(new Date(event.startAt), "h:mm")} -{" "}
+                                    {format(new Date(event.endAt), "h:mm a")}
+                                  </span>
+                                </div>
+
+                                {/* Resize Handle */}
+                                <div
+                                  className="absolute bottom-0 left-0 right-0 h-3 cursor-s-resize hover:bg-black/10 z-20"
+                                  onMouseDown={(e) => handleResizeMouseDown(e, event, day)}
+                                />
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </div>
             </div>
           </div>
         </main>
-      </div>
+      </div >
 
       {/* Create/Edit Event Modal */}
-      <EventCreateModal
+      < EventCreateModal
         isOpen={dialogOpen}
         onClose={() => {
           setDialogOpen(false);
@@ -1417,59 +1443,79 @@ export function PomodoroCalendar() {
       </div>
 
       {/* Pomodoro Timer Modal */}
-      {activePomodoro && (
-        <PomodoroTimerModal
-          isOpen={timerModalOpen}
-          onClose={() => {
-            // Can only close modal, but timer keeps running in header
-            setTimerModalOpen(false);
-          }}
-          eventTitle={activePomodoro.title}
-          inputDuration={activePomodoro.inputDuration}
-          outputDuration={activePomodoro.outputDuration}
-          onComplete={handleTimerComplete}
-          eventStartAt={activePomodoro.startAt}
-          eventEndAt={activePomodoro.endAt}
-          timerState={persistentTimer.state}
-          onDebugSkip1Min={persistentTimer.debugSkip1Min}
-          onDebugSkip10Min={persistentTimer.debugSkip10Min}
-        />
-      )}
+      {
+        activePomodoro && (
+          <PomodoroTimerModal
+            isOpen={timerModalOpen}
+            onClose={() => {
+              // Can only close modal, but timer keeps running in header
+              setTimerModalOpen(false);
+            }}
+            eventTitle={activePomodoro.title}
+            inputDuration={activePomodoro.inputDuration}
+            outputDuration={activePomodoro.outputDuration}
+            onComplete={handleTimerComplete}
+            eventStartAt={activePomodoro.startAt}
+            eventEndAt={activePomodoro.endAt}
+            timerState={persistentTimer.state}
+            feedbackText={feedbackText}
+            onFeedbackChange={setFeedbackText}
+            onFeedbackSubmit={() => {
+              // Manual submission of feedback
+              const finalBlurtingText = blurtingSession.state.blurtingText;
+              blurtingSession.endSession();
+              setTimerModalOpen(false);
+              handleTimerComplete(finalBlurtingText, feedbackText);
+              notifications.notifyPhaseChange("completed", activePomodoro.title);
+              setActivePomodoro(null);
+              persistentTimer.reset();
+              setFeedbackText(""); // Clear
+            }}
+          />
+        )
+      }
 
       {/* Persistent Blurting Modal (shown when in output phase) */}
-      {activePomodoro && showBlurtingModal && persistentTimer.state.phase === "output" && (
-        <BlurtingModal
-          isOpen={true}
-          onClose={() => { }} // Cannot close during blurting
-          onComplete={(text) => {
-            blurtingSession.endSession();
-            setShowBlurtingModal(false);
-            handleTimerComplete(text);
-            // Send completion notification
-            notifications.notifyPhaseChange("completed", activePomodoro.title);
-            // Session is done - reset everything
-            setActivePomodoro(null);
-            persistentTimer.reset();
-          }}
-          eventTitle={activePomodoro.title}
-          initialText={blurtingSession.state.blurtingText}
-          canComplete={persistentTimer.state.remainingSeconds <= 0}
-          remainingSeconds={persistentTimer.state.remainingSeconds}
-          totalSeconds={persistentTimer.state.totalSeconds}
-          onTextChange={blurtingSession.updateText}
-          onDebugSkip1Min={persistentTimer.debugSkip1Min}
-        />
-      )}
+      {
+        activePomodoro && showBlurtingModal && persistentTimer.state.phase === "output" && (
+          <BlurtingModal
+            isOpen={true}
+            onClose={() => { }} // Cannot close during blurting
+            onComplete={(text) => {
+              blurtingSession.endSession();
+              setShowBlurtingModal(false);
+              handleTimerComplete(text);
+              // Send completion notification
+              notifications.notifyPhaseChange("completed", activePomodoro.title);
+              // Session is done - reset everything
+              setActivePomodoro(null);
+              persistentTimer.reset();
+            }}
+            eventTitle={activePomodoro.title}
+            initialText={blurtingSession.state.blurtingText}
+            canComplete={persistentTimer.state.remainingSeconds <= 0}
+            remainingSeconds={persistentTimer.state.remainingSeconds}
+            totalSeconds={persistentTimer.state.totalSeconds}
+            onTextChange={blurtingSession.updateText}
+          />
+        )
+      }
 
       {/* Completed Pomodoro Warning Toast */}
-      {completedPomodoroWarning && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-4 fade-in duration-300">
-          <div className="flex items-center gap-3 bg-amber-500 text-white px-4 py-3 rounded-lg shadow-lg">
-            <span className="material-symbols-outlined">lock</span>
-            <span className="font-medium">Completed Pomodoros cannot be edited. Only deletion is allowed.</span>
+      {
+        completedPomodoroWarning && (
+          <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-in slide-in-from-bottom-4 fade-in duration-300">
+            <div className="flex items-center gap-3 bg-amber-500 text-white px-4 py-3 rounded-lg shadow-lg">
+              <span className="material-symbols-outlined">lock</span>
+              <span className="font-medium">
+                {activePomodoro // Reusing the same state for different warnings is a bit hacky but works for now
+                  ? "Cannot move or resize Pomodoro events to overlap with current time."
+                  : "Completed Pomodoros cannot be edited. Only deletion is allowed."}
+              </span>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )
+      }
+    </div >
   );
 }

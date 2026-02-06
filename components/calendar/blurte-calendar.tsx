@@ -8,6 +8,7 @@ import interactionPlugin, { DateClickArg } from "@fullcalendar/interaction";
 import type { EventInput, DateSelectArg } from "@fullcalendar/core";
 import { format } from "date-fns";
 import { rrulestr } from "rrule";
+import { useCsrf } from "@/hooks/use-csrf";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -57,6 +58,7 @@ const weekdayFromDate = (date: Date) => weekdayOptions[date.getDay()]?.value ?? 
 const formatDateTimeLocal = (date: Date) => format(date, "yyyy-MM-dd'T'HH:mm");
 
 export function BlurteCalendar() {
+  const csrfToken = useCsrf();
   const calendarRef = React.useRef<FullCalendar | null>(null);
   const [events, setEvents] = React.useState<EventRecord[]>([]);
   const [activeRange, setActiveRange] = React.useState<CalendarRange | null>(null);
@@ -165,7 +167,10 @@ export function BlurteCalendar() {
 
     const response = await fetch("/api/events", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken || "",
+      },
       body: JSON.stringify(payload),
     });
 

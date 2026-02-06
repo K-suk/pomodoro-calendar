@@ -1,23 +1,34 @@
 
-import { createClient } from "@/utils/supabase/server";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { CreatePomodoroLogSchema } from "@/lib/validations";
+import { requireAuth } from "@/lib/auth";
+import { validateCsrfToken } from "@/lib/csrf";
 
 export async function POST(req: NextRequest) {
   try {
-    const supabase = await createClient();
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    const auth = await requireAuth();
+    if (auth instanceof NextResponse) return auth;
+    const user = auth;
 
-    if (authError || !user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    // Validate CSRF token
+    const csrfToken = req.headers.get("X-CSRF-Token");
+    const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+    if (!isValidCsrf) {
+      return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
     }
 
-    const body = await req.json();
-    const { eventId, blurtingText, inputMinutes, outputMinutes } = body;
+    const json = await req.json();
+    const result = CreatePomodoroLogSchema.safeParse(json);
 
-    if (!eventId || inputMinutes === undefined || outputMinutes === undefined) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+    if (!result.success) {
+      return NextResponse.json(
+        { error: "Validation failed", details: result.error.flatten() },
+        { status: 400 }
+      );
     }
+
+    const { eventId, blurtingText, sessionFeedback, inputMinutes, outputMinutes } = result.data;
 
     // Check if the event belongs to the user (security check)
     const event = await prisma.event.findUnique({
@@ -37,6 +48,7 @@ export async function POST(req: NextRequest) {
       data: {
         eventId,
         blurtingText: blurtingText || "",
+        sessionFeedback: sessionFeedback || null,
         inputMinutes,
         outputMinutes,
         actualDate: new Date(),

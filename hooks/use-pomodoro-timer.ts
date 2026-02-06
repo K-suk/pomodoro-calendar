@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
-export type PomodoroPhase = 'idle' | 'input' | 'output' | 'completed';
+export type PomodoroPhase = 'idle' | 'input' | 'output' | 'break' | 'completed';
 
 export type PomodoroState = {
   phase: PomodoroPhase;
@@ -9,6 +9,7 @@ export type PomodoroState = {
   isRunning: boolean;
   inputDuration: number; // minutes
   outputDuration: number; // minutes
+  breakDuration: number; // minutes
 };
 
 // Storage key for persisting timer state
@@ -21,7 +22,10 @@ type StoredTimerState = {
   totalSeconds: number;
   inputDuration: number;
   outputDuration: number;
+  breakDuration: number;
   eventId?: string; // to identify which event this timer is for
+  customInputDuration?: number;
+  customOutputDuration?: number;
 };
 
 export type UsePomodoroTimerReturn = {
@@ -31,6 +35,7 @@ export type UsePomodoroTimerReturn = {
   resume: () => void;
   reset: () => void;
   skipToOutput: () => void;
+  skipToBreak: () => void;
   // Debug functions (remove later)
   debugSkip1Min: () => void;
   debugSkip10Min: () => void;
@@ -103,6 +108,7 @@ export function usePomodoroTimer(
         isRunning: remaining > 0,
         inputDuration: storedState.inputDuration,
         outputDuration: storedState.outputDuration,
+        breakDuration: storedState.breakDuration || 5,
       };
     }
     
@@ -113,6 +119,7 @@ export function usePomodoroTimer(
       isRunning: false,
       inputDuration,
       outputDuration,
+      breakDuration: 5, // Default break duration
     };
   }, [storedState, inputDuration, outputDuration, calculateRemaining]);
 
@@ -137,6 +144,8 @@ export function usePomodoroTimer(
     const targetEventId = eventId ?? resolvedEventId;
     const actualInputDuration = customInputDuration ?? inputDuration;
     const actualOutputDuration = customOutputDuration ?? outputDuration;
+    const actualBreakDuration = 5; // Fixed for now
+
     if (targetEventId && typeof window !== 'undefined') {
       const stateToSave: StoredTimerState = {
         phase,
@@ -144,6 +153,7 @@ export function usePomodoroTimer(
         totalSeconds,
         inputDuration: actualInputDuration,
         outputDuration: actualOutputDuration,
+        breakDuration: actualBreakDuration,
         eventId: targetEventId,
       };
       try {
@@ -210,18 +220,48 @@ export function usePomodoroTimer(
             isRunning: true, // Timer runs during blurting phase
           }));
         } else {
-          // No output phase (focus only mode), go directly to completed
-          clearTimer();
-          clearSavedState();
-          onPhaseChangeRef.current?.('completed');
+          // No output phase, go to break directly
+          const breakSeconds = (storedState.breakDuration || 5) * 60;
+          const newStartTime = now;
+          phaseStartTimeRef.current = newStartTime;
+          saveState(
+            'break',
+            breakSeconds,
+            startTimeRef.current || newStartTime,
+            storedState.inputDuration,
+            storedState.outputDuration
+          );
+          onPhaseChangeRef.current?.('break');
           setState((prev) => ({
             ...prev,
-            phase: 'completed',
-            remainingSeconds: 0,
-            isRunning: false,
+            phase: 'break',
+            remainingSeconds: breakSeconds,
+            totalSeconds: breakSeconds,
+            isRunning: true,
           }));
         }
       } else if (storedState.phase === 'output') {
+        // Output done, go to break
+        const breakSeconds = (storedState.breakDuration || 5) * 60;
+        const newStartTime = now;
+        phaseStartTimeRef.current = newStartTime;
+        saveState(
+          'break',
+          breakSeconds,
+          startTimeRef.current || newStartTime,
+          storedState.inputDuration,
+          storedState.outputDuration
+        );
+        onPhaseChangeRef.current?.('break');
+        setState((prev) => ({
+          ...prev,
+          phase: 'break',
+          remainingSeconds: breakSeconds,
+          totalSeconds: breakSeconds,
+          isRunning: true,
+        }));
+      } else if (storedState.phase === 'break') {
+        // Break done, complete (or handle sets later)
         clearTimer();
         clearSavedState();
         onPhaseChangeRef.current?.('completed');
@@ -294,6 +334,7 @@ export function usePomodoroTimer(
       isRunning: true,
       inputDuration: actualInputDuration,
       outputDuration: actualOutputDuration,
+      breakDuration: 5,
     });
     onPhaseChangeRef.current?.('input');
   }, [inputDuration, outputDuration, saveState]);
@@ -306,14 +347,27 @@ export function usePomodoroTimer(
   const resume = useCallback(() => {
     if (!storedState || storedState.phase === 'idle' || storedState.phase === 'completed') return;
     
-    // Adjust phase start time to account for pause duration
+    // Calculate new start time based on remaining seconds in state
+    // We want: now + remaining = finish time
+    // So: start = now - (total - remaining)
     const now = Date.now();
-    const elapsedFromPhaseStart = Math.floor((now - (phaseStartTimeRef.current || now)) / 1000);
-    const alreadyElapsed = storedState.totalSeconds - (storedState.totalSeconds - elapsedFromPhaseStart);
-    phaseStartTimeRef.current = now - alreadyElapsed * 1000;
+    const elapsedReal = state.totalSeconds - state.remainingSeconds;
+    const newStartTime = now - (elapsedReal * 1000);
+    
+    phaseStartTimeRef.current = newStartTime;
+    startTimeRef.current = newStartTime;
+    
+    // Save state to persist the pause adjustment
+    saveState(
+      storedState.phase, 
+      storedState.totalSeconds, 
+      newStartTime, 
+      storedState.inputDuration, 
+      storedState.outputDuration
+    );
     
     setState((prev) => ({ ...prev, isRunning: true }));
-  }, [storedState]);
+  }, [storedState, state.totalSeconds, state.remainingSeconds, saveState]);
 
   const reset = useCallback(() => {
     clearSavedState();
@@ -324,27 +378,54 @@ export function usePomodoroTimer(
       isRunning: false,
       inputDuration,
       outputDuration,
+      breakDuration: 5,
     });
   }, [inputDuration, outputDuration, clearSavedState]);
 
   const skipToOutput = useCallback(() => {
     if (!storedState || storedState.phase !== 'input') return;
+
+    // Logic: Skip Input. If output > 0, go to output. Else go to break.
+    // For now, let's just use existing skipToOutput logic but respect 0 duration?
+    // Actually if outputDuration is 0, we should skip to BREAK.
     
-    const outputSeconds = outputDuration * 60;
+    if (outputDuration > 0) {
+      const outputSeconds = outputDuration * 60;
+      const now = Date.now();
+      phaseStartTimeRef.current = now;
+      
+      saveState('output', outputSeconds, startTimeRef.current || now);
+      
+      setState((prev) => ({
+        ...prev,
+        phase: 'output',
+        remainingSeconds: outputSeconds,
+        totalSeconds: outputSeconds,
+        isRunning: true,
+      }));
+      onPhaseChangeRef.current?.('output');
+    } else {
+      // Go to Break
+      skipToBreak();
+    }
+  }, [storedState, outputDuration, saveState]);
+
+  const skipToBreak = useCallback(() => {
+    const breakSeconds = 5 * 60;
     const now = Date.now();
     phaseStartTimeRef.current = now;
     
-    saveState('output', outputSeconds, startTimeRef.current || now);
+    saveState('break', breakSeconds, startTimeRef.current || now);
     
     setState((prev) => ({
       ...prev,
-      phase: 'output',
-      remainingSeconds: outputSeconds,
-      totalSeconds: outputSeconds,
+      phase: 'break',
+      remainingSeconds: breakSeconds,
+      totalSeconds: breakSeconds,
       isRunning: true,
     }));
-    onPhaseChangeRef.current?.('output');
-  }, [storedState, outputDuration, saveState]);
+    onPhaseChangeRef.current?.('break');
+  }, [saveState]);
 
   // Handle page visibility changes (tab switching)
   useEffect(() => {
@@ -378,6 +459,7 @@ export function usePomodoroTimer(
           isRunning: true,
           inputDuration: storedState.inputDuration,
           outputDuration: storedState.outputDuration,
+          breakDuration: storedState.breakDuration || 5,
         }));
       } else {
         // Timer expired, transition phase or complete
@@ -385,6 +467,18 @@ export function usePomodoroTimer(
       }
     }
   }, [storedState, calculateRemaining, updateTimer]);
+
+  // Sync timer every 3 minutes to correct any drift
+  useEffect(() => {
+    if (!state.isRunning) return;
+    
+    const syncInterval = setInterval(() => {
+      // Explicitly recalculate time from start timestamp
+      updateTimer();
+    }, 3 * 60 * 1000);
+    
+    return () => clearInterval(syncInterval);
+  }, [state.isRunning, updateTimer]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -417,6 +511,7 @@ export function usePomodoroTimer(
     resume,
     reset,
     skipToOutput,
+    skipToBreak,
     debugSkip1Min,
     debugSkip10Min,
   };

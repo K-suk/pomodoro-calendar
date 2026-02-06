@@ -1,28 +1,16 @@
 import { NextResponse } from "next/server";
 
 import { prisma } from "@/lib/prisma";
-import { createClient } from "@/utils/supabase/server";
-
-type CategoryPayload = {
-  title?: string;
-  color?: string;
-  isPrivate?: boolean;
-};
-
-async function getAuthenticatedUser() {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  return user;
-}
+import { CreateCategorySchema, UpdateCategorySchema } from "@/lib/validations";
+import { requireAuth } from "@/lib/auth";
+import { validateCsrfToken } from "@/lib/csrf";
+import { checkRateLimit } from "@/lib/rate-limit";
 
 // GET: Get all categories (public + user's private)
 export async function GET() {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
 
   // Get public categories (isPrivate = false, userId = null)
   const publicCategories = await prisma.category.findMany({
@@ -49,19 +37,39 @@ export async function GET() {
 
 // POST: Create a new category (always private for users)
 export async function POST(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Rate Limiting (100 requests / minute)
+  if (!checkRateLimit(user.id)) {
+    return NextResponse.json(
+      { error: "Too many requests. Please try again later." },
+      { status: 429 }
+    );
+  }
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
   if (!user.email) {
     return NextResponse.json({ error: "User email required" }, { status: 400 });
   }
 
-  const body = (await request.json()) as CategoryPayload;
-  if (!body.title || !body.color) {
-    return NextResponse.json({ error: "Title and color are required" }, { status: 400 });
+  const json = await request.json();
+  // Validations
+  const result = CreateCategorySchema.safeParse(json);
+  if (!result.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: result.error.flatten() },
+      { status: 400 }
+    );
   }
+  const body = result.data;
 
   // Ensure user exists
   await prisma.user.upsert({
@@ -98,12 +106,27 @@ export async function POST(request: Request) {
 
 // PUT: Update a category
 export async function PUT(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
-  const body = (await request.json()) as CategoryPayload & { id?: string };
+  const json = await request.json();
+  const result = UpdateCategorySchema.safeParse(json);
+  if (!result.success) {
+    return NextResponse.json(
+      { error: "Validation failed", details: result.error.flatten() },
+      { status: 400 }
+    );
+  }
+  const body = result.data;
+
   if (!body.id) {
     return NextResponse.json({ error: "Category ID is required" }, { status: 400 });
   }
@@ -120,8 +143,8 @@ export async function PUT(request: Request) {
   const category = await prisma.category.update({
     where: { id: body.id },
     data: {
-      title: body.title ?? existingCategory.title,
-      color: body.color ?? existingCategory.color,
+      title: body.title,
+      color: body.color,
       // isPrivate cannot be changed by users (always true)
     },
   });
@@ -131,9 +154,15 @@ export async function PUT(request: Request) {
 
 // DELETE: Delete a category
 export async function DELETE(request: Request) {
-  const user = await getAuthenticatedUser();
-  if (!user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const auth = await requireAuth();
+  if (auth instanceof NextResponse) return auth;
+  const user = auth;
+
+  // Validate CSRF token
+  const csrfToken = request.headers.get("X-CSRF-Token");
+  const isValidCsrf = await validateCsrfToken(csrfToken || "", user.id);
+  if (!isValidCsrf) {
+    return NextResponse.json({ error: "Invalid CSRF token" }, { status: 403 });
   }
 
   const { searchParams } = new URL(request.url);

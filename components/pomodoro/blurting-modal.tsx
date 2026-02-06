@@ -13,8 +13,6 @@ type BlurtingModalProps = {
   initialText?: string;
   canComplete?: boolean; // Only allow completion when true (timer finished)
   onTextChange?: (text: string) => void; // Sync text changes to parent
-  // Debug function (remove later)
-  onDebugSkip1Min?: () => void;
 };
 
 export function BlurtingModal({
@@ -27,7 +25,6 @@ export function BlurtingModal({
   initialText = "",
   canComplete = true, // Default to true for backwards compatibility
   onTextChange,
-  onDebugSkip1Min,
 }: BlurtingModalProps) {
   void _onClose; // Suppress unused variable warning
   const [text, setText] = React.useState(initialText);
@@ -153,15 +150,7 @@ export function BlurtingModal({
               <span>{isSaving ? "Saving..." : "Saved"}</span>
             </div>
             <div className="flex items-center gap-4">
-              {/* Debug button (remove later) */}
-              {onDebugSkip1Min && (
-                <button
-                  onClick={onDebugSkip1Min}
-                  className="px-3 py-1 text-xs bg-orange-500 text-white rounded hover:bg-orange-600"
-                >
-                  +1分
-                </button>
-              )}
+
               {/* No cancel button - must complete the blurting session */}
               <button
                 className={`flex min-w-[100px] items-center justify-center overflow-hidden rounded-lg h-10 px-6 text-sm font-bold leading-normal tracking-wide transition-all ${canComplete
